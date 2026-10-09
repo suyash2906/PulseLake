@@ -1151,8 +1151,12 @@ tbody tr:hover { background: rgba(76, 201, 240, 0.05); }
   box-shadow: 0 0 60px rgba(76, 201, 240, 0.25);
 }
 .qr-card h2 { margin: 0; font-size: 20px; }
+.qr-card {
+  max-height: 94vh;
+  overflow: auto;
+}
 .qr {
-  width: min(360px, 70vw);
+  width: min(360px, 70vw, 55vh);
   padding: 14px;
   background: white;
   border-radius: 18px;
