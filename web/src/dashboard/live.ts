@@ -22,6 +22,7 @@ export function useLiveFeed() {
         connection = c;
         c.client.subscribe([TOPICS.allTelemetry, TOPICS.allEvents, TOPICS.alerts, TOPICS.presence], { qos: 0 });
         c.client.on("message", (topic, payload) => {
+          if (fleet.mode === "replay") return; // the time machine owns the screen
           let msg: any;
           try {
             msg = JSON.parse(payload.toString());

@@ -209,6 +209,9 @@ Resources:
                 Action: iam:PutRolePolicy
                 Resource: !GetAtt GuestRole.Arn
               - Effect: Allow
+                Action: lambda:PutFunctionConcurrency
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-fleet-simulator"
+              - Effect: Allow
                 Action: [ssm:GetParameter, ssm:PutParameter]
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*"
 
@@ -236,6 +239,7 @@ Resources:
           STATUS_PARAM: !Ref KillStatusParameter
           TESTING_CAP: !Ref TestingCapUsd
           DEMO_CAP: !Ref DemoCapUsd
+          SIM_FUNCTION_NAME: !Sub "${ProjectName}-fleet-simulator"
 
   KillSwitchSubscription:
     Type: AWS::SNS::Subscription
@@ -399,7 +403,7 @@ Resources:
         Description: Abnormal telemetry (or heartbeat sample) -> alert processor
         Sql: >-
           SELECT *, 'telemetry' AS kind FROM 'pulselake/devices/+/telemetry'
-          WHERE fault <> 'NONE' OR health <> 'OK' OR temp > 70 OR volt > 6 OR bat < 10
+          WHERE fault <> 'NONE' OR health <> 'OK' OR temp > 55 OR volt > 6 OR bat < 10
           OR vibPeak > 15 OR seq % 5 = 0
         RuleDisabled: false
         Actions:
@@ -614,6 +618,7 @@ Resources:
             - { Name: vib, Type: double }
             - { Name: vibpeak, Type: double }
             - { Name: acc, Type: "array<double>" }
+            - { Name: ori, Type: "array<array<double>>" }
             - { Name: sensors, Type: string }
             - { Name: thing, Type: string }
             - { Name: ingest_ts, Type: bigint }
@@ -692,6 +697,7 @@ Resources:
             - { Name: status, Type: string }
             - { Name: message, Type: string }
             - { Name: source, Type: string }
+            - { Name: resolvedat, Type: bigint }
 
   AthenaWorkGroup:
     Type: AWS::Athena::WorkGroup
@@ -758,10 +764,22 @@ Resources:
                 Resource: !Sub "${LakeBucket.Arn}/athena-results/*"
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt LakeEtlFunction.Arn
+                Resource: [!GetAtt LakeEtlFunction.Arn, !GetAtt FleetSimulatorFunction.Arn]
               - Effect: Allow
                 Action: ssm:GetParameter
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/etl-status"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/etl-status"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/sim-status"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/phase"
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/sim-status"
+              - Effect: Allow
+                Action: budgets:ViewBudget
+                Resource: !Sub "arn:aws:budgets::${AWS::AccountId}:budget/pulselake-total-cap"
+              - Effect: Allow
+                Action: freetier:GetAccountPlanState
+                Resource: "*"
 
   # ================================================================== PHASE 4: silver / gold ETL
   EtlStatusParameter:
@@ -834,6 +852,103 @@ Resources:
           LAKE_BUCKET: !Ref LakeBucket
           ETL_STATUS_PARAM: !Ref EtlStatusParameter
 
+  # Hourly ETL (skips itself when no new data arrived -> no Athena cost while idle)
+  EtlSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-etl
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LakeEtlFunction.Arn
+
+  EtlSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-hourly-etl"
+      Description: Bronze -> Silver -> Gold every hour when there is new data
+      ScheduleExpression: rate(1 hour)
+      FlexibleTimeWindow: { Mode: "OFF" }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt LakeEtlFunction.Arn
+        RoleArn: !GetAtt EtlSchedulerRole.Arn
+        Input: '{"trigger":"schedule"}'
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  # ================================================================== PHASE 5: virtual fleet (scalability test)
+  SimStatusParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/sim-status"
+      Type: String
+      Value: '{"state":"NEVER_RUN"}'
+
+  FleetSimulatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: fleet-simulator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iot:DescribeEndpoint
+                Resource: "*"
+              - Effect: Allow
+                Action: iot:Publish
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/SIM_*/telemetry"
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/sim-status"
+
+  FleetSimulatorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-fleet-simulator"
+      RetentionInDays: 7
+
+  FleetSimulatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FleetSimulatorLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-fleet-simulator"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/fleet_simulator
+      Role: !GetAtt FleetSimulatorRole.Arn
+      Timeout: 180 # max run is 120 s
+      MemorySize: 512
+      Environment:
+        Variables:
+          SIM_STATUS_PARAM: !Ref SimStatusParameter
+
+  FleetSimulatorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref FleetSimulatorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0 # never re-run a load test automatically
+
   AnalyticsLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -860,6 +975,9 @@ Resources:
           LAKE_BUCKET: !Ref LakeBucket
           ETL_FUNCTION: !Ref LakeEtlFunction
           ETL_STATUS_PARAM: !Ref EtlStatusParameter
+          SIM_FUNCTION: !Ref FleetSimulatorFunction
+          SIM_STATUS_PARAM: !Ref SimStatusParameter
+          PHASE_PARAM: !Ref PhaseParameter
 
   AnalyticsUrl:
     Type: AWS::Lambda::Url

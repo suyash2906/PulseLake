@@ -61,6 +61,36 @@ CONDITIONS = [
 ]
 
 
+# ----------------------------------------------------------------- predictive early warning
+PREDICT_LIMIT_C = 70.0       # same limit as OVERHEAT
+PREDICT_HORIZON_S = 60       # warn if the limit will be crossed within 60 s
+PREDICT_MIN_SLOPE = 0.15     # C per second - ignore slow drift / noise
+HIST_WINDOW_MS = 25_000      # fit the trend on the last 25 s (older calm readings would hide a new rise)
+PREDICT_HOLD_MS = 6_000      # keep the warning a few seconds to avoid flapping
+
+
+def predict_overheat(hist):
+    """Least-squares trend line over recent [ts_ms, temp] samples.
+    Returns (slope C/s, seconds until 70 C, fitted temp now) or None."""
+    pts = [p for p in hist if hist[-1][0] - p[0] <= HIST_WINDOW_MS]
+    if len(pts) < 4:
+        return None
+    t0 = pts[0][0]
+    xs = [(p[0] - t0) / 1000.0 for p in pts]
+    ys = [float(p[1]) for p in pts]
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    now_fit = my + slope * (xs[-1] - mx)
+    if slope < PREDICT_MIN_SLOPE or ys[-1] >= PREDICT_LIMIT_C:
+        return None
+    eta = (PREDICT_LIMIT_C - max(now_fit, ys[-1])) / slope
+    return (slope, eta, now_fit) if 0 < eta <= PREDICT_HORIZON_S else None
+
+
 def fingerprint(m):
     """Readings that always carry noise on a healthy device. Identical values = frozen sensor."""
     return "|".join(str(m.get(k)) for k in ("temp", "hum", "volt", "acc", "vib"))
@@ -94,6 +124,8 @@ def publish_alert(alert):
 def maybe_email(device, alert):
     if not SNS_TOPIC or alert["severity"] != "CRITICAL" or alert["status"] != "ACTIVE":
         return
+    if alert["deviceId"].startswith("SIM_"):
+        return  # virtual fleet (load test) never emails
     if now_ms() - int(device.get("lastEmailAt", 0)) < EMAIL_COOLDOWN_MS:
         return
     try:
@@ -121,7 +153,7 @@ def maybe_email(device, alert):
     )
 
 
-def open_alert(device, a_type, severity, message, source, hit_ts):
+def open_alert(device, a_type, severity, message, source, hit_ts, extra=None):
     """Create an ACTIVE alert unless one of this type is already open (conditional write)."""
     ts = now_ms()
     alert = {
@@ -134,6 +166,7 @@ def open_alert(device, a_type, severity, message, source, hit_ts):
         "status": "ACTIVE",
         "message": message,
         "source": source,
+        **(extra or {}),
     }
     sk = f"{ts:013d}#{alert['alertId']}"
     try:
@@ -214,17 +247,36 @@ def handle_telemetry(m):
     if frozen_count >= 2:
         hits["SENSOR_FROZEN"] = ("WARNING", "Last 3 readings are identical - sensor appears frozen")
 
+    # Predictive analytics: fit a trend on recent temperatures and warn BEFORE the limit.
+    msg_ts = int(_num(m, "ts"))
+    hist = [p for p in (device.get("tempHist") or []) if msg_ts - p[0] <= HIST_WINDOW_MS and p[0] < msg_ts]
+    hist = (hist + [[msg_ts, round(_num(m, "temp"), 2)]])[-15:]
+    extra = {}
+    prediction = predict_overheat(hist)
+    if prediction:
+        slope, eta, now_fit = prediction
+        hits["PREDICTED_OVERHEAT"] = (
+            "WARNING",
+            f"Temperature rising {slope:.1f} C/s - predicted to exceed 70 C in ~{eta:.0f} s (now {now_fit:.1f} C)",
+        )
+        extra["PREDICTED_OVERHEAT"] = {"etaSec": round(eta, 1), "slope": round(slope, 2)}
+    if "OVERHEAT" in hits and "PREDICTED_OVERHEAT" in active:
+        lead = (ts - int(active["PREDICTED_OVERHEAT"].get("since", ts))) / 1000
+        sev, text = hits["OVERHEAT"]
+        hits["OVERHEAT"] = (sev, f"{text} - the cloud predicted it {lead:.0f} s in advance")
+        extra["OVERHEAT"] = {"predictedLeadSec": round(lead, 1)}
+
     # Messages can arrive out of order (parallel Lambdas). Only a NEWER reading may change
     # alert state; the conditional write makes that check atomic.
     try:
         DEVICES.update_item(
             Key={"deviceId": device_id},
             UpdateExpression="SET fingerprint = :fp, frozenCount = :fc, lastSeq = :sq, lastTs = :mts, lastSeen = :ts, "
-                             "#o = :o, #p = :p, health = :h, #on = :on",
+                             "tempHist = :th, #o = :o, #p = :p, health = :h, #on = :on",
             ConditionExpression="attribute_not_exists(lastTs) OR lastTs < :mts",
             ExpressionAttributeNames={"#o": "owner", "#p": "profile", "#on": "online"},  # DynamoDB reserved words
-            ExpressionAttributeValues={":fp": fp, ":fc": frozen_count, ":sq": seq, ":mts": int(_num(m, "ts")), ":ts": ts,
-                                       ":o": m.get("owner", ""), ":p": m.get("profile", ""),
+            ExpressionAttributeValues={":fp": fp, ":fc": frozen_count, ":sq": seq, ":mts": msg_ts, ":ts": ts,
+                                       ":th": to_ddb(hist), ":o": m.get("owner", ""), ":p": m.get("profile", ""),
                                        ":h": m.get("health", "OK"), ":on": True},
         )
     except ClientError as e:
@@ -247,14 +299,18 @@ def handle_telemetry(m):
                 except ClientError:
                     pass  # resolved meanwhile
         else:
-            open_alert(device, a_type, severity, message, "CLOUD_RULE", ts)
+            open_alert(device, a_type, severity, message, "CLOUD_RULE", ts, extra.get(a_type))
 
     holds = {c[0]: c[4] for c in CONDITIONS}
+    holds["PREDICTED_OVERHEAT"] = PREDICT_HOLD_MS
     for a_type, info in active.items():
         if info.get("source") != "CLOUD_RULE" or a_type in hits:
             continue
-        if ts - int(info.get("lastHit", 0)) >= holds.get(a_type, 0):
-            resolve_alert(device, a_type, info, "readings back to normal")
+        if a_type == "PREDICTED_OVERHEAT" and "OVERHEAT" in hits:
+            resolve_alert(device, a_type, info, "prediction confirmed - the device overheated")
+        elif ts - int(info.get("lastHit", 0)) >= holds.get(a_type, 0):
+            reason = "temperature trend stabilised" if a_type == "PREDICTED_OVERHEAT" else "readings back to normal"
+            resolve_alert(device, a_type, info, reason)
 
 
 def handle_presence(p):

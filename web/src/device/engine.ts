@@ -52,6 +52,7 @@ export class DeviceEngine {
   private tempTarget: number;
   private humTarget: number;
   private simBattery = 70 + Math.random() * 25;
+  private overheatRate = 1; // °C per second while OVERHEAT is injected
   private frozen: Telemetry | null = null;
   private lastTouch = Date.now();
   private wakeLock: any = null;
@@ -234,6 +235,7 @@ export class DeviceEngine {
   inject(fault: Exclude<Fault, "NONE">) {
     if (fault === "CRASH") return this.crash();
     if (fault === "NETWORK_DROP") return this.networkDrop();
+    if (fault === "OVERHEAT") this.overheatRate = Math.max(0.9, (76 - this.state.temp) / 25);
     this.frozen = null;
     this.set({ fault });
     this.publishEvent("FAULT_INJECTED");
@@ -319,7 +321,9 @@ export class DeviceEngine {
     let temp = s.temp + (this.tempTarget - s.temp) * 0.25 * dt + noise(0.15);
     let volt = 5 + noise(0.03);
     let bat = w.bat ?? (this.simBattery = Math.max(1, this.simBattery - 0.01 * dt));
-    if (s.fault === "OVERHEAT") temp = Math.min(98, s.temp + (2.5 + Math.random()) * dt);
+    // ramp so the 70 °C limit is crossed ~25 s after injection -> the cloud's trend
+    // prediction has time to warn first (predictive analytics demo)
+    if (s.fault === "OVERHEAT") temp = Math.min(98, s.temp + this.overheatRate * (0.8 + Math.random() * 0.4) * dt);
     if (s.fault === "POWER_SURGE") {
       volt = 6.4 + Math.random() * 3;
       temp = s.temp + 0.4 * dt + noise(0.3);

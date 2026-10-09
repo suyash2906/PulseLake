@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef } from "react";
-import { FAULTS, PROFILES } from "../shared/types";
+import { FAULTS, PROFILES, type Alert } from "../shared/types";
 import { setDesired } from "./live";
 import { Sparkline } from "./Sparkline";
 import { statusOf, type DeviceStatus, type DeviceView } from "./store";
@@ -14,8 +14,12 @@ const STATUS_META: Record<DeviceStatus, { label: string; tone: string }> = {
   LEFT: { label: "DISCONNECTED", tone: "off" },
 };
 
-export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl }: { d: DeviceView; now: number; joinUrl: string }) {
+export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: { d: DeviceView; now: number; joinUrl: string; alerts: Alert[] }) {
   const status = statusOf(d, now);
+  const prediction = alerts.find((a) => a.deviceId === d.id && a.type === "PREDICTED_OVERHEAT" && a.status === "ACTIVE");
+  const confirmed = alerts.find((a) => a.deviceId === d.id && a.type === "OVERHEAT" && a.status === "ACTIVE" && a.predictedLeadSec);
+  // the cloud raises the warning; the countdown is re-estimated live from the newest readings
+  const eta = prediction ? liveEta(d.hist) ?? Math.max(0, (prediction.etaSec ?? 0) - (now - prediction.ts) / 1000) : null;
   const meta = STATUS_META[status];
   const t = d.last;
   const profile = PROFILES.find((p) => p.key === d.profile);
@@ -67,6 +71,16 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl }: { d: Dev
               <Sparkline values={d.hist.map((h) => h.temp)} color="#ff9f43" threshold={70} />
             </div>
           </div>
+          {eta !== null && !dead && (
+            <div className="dev-predict">
+              <span>🔮 Cloud predicts <b>OVERHEAT</b> in</span>
+              <b className="mono">{Math.round(eta)} s</b>
+              <div className="pbar"><i style={{ width: `${Math.max(4, 100 - (eta / 60) * 100)}%` }} /></div>
+            </div>
+          )}
+          {confirmed && !dead && (
+            <div className="dev-fault sev-warning">🔮 Prediction confirmed - the cloud warned {Math.round(confirmed.predictedLeadSec!)} s before it happened</div>
+          )}
           {fault && !dead && (
             <div className={`dev-fault sev-${fault.severity.toLowerCase()}`}>
               {fault.icon} Injected fault: <b>{fault.label}</b>
@@ -129,7 +143,8 @@ function Tilt({ d, dead, status }: { d: DeviceView; dead: boolean; status: Devic
         }
       }
       if (ref.current) {
-        ref.current.style.transform = `rotateX(${cur.current.beta * 0.6}deg) rotateY(${cur.current.gamma * 0.8}deg)`;
+        // small base angle so the phone's thickness is visible even when it lies flat
+        ref.current.style.transform = `rotateX(${10 + cur.current.beta * 0.6}deg) rotateY(${-18 + cur.current.gamma * 0.8}deg)`;
       }
       raf = requestAnimationFrame(tick);
     };
@@ -139,9 +154,18 @@ function Tilt({ d, dead, status }: { d: DeviceView; dead: boolean; status: Devic
   return (
     <div className="tilt-stage">
       <div ref={ref} className={`phone3d ${dead ? "dead" : ""} ps-${status.toLowerCase()}`}>
-        <div className="screen">
-          <div className="notch" />
-          <div className="pulse" />
+        {/* six faces = a phone with real thickness */}
+        <div className="face back"><span className="cam" /></div>
+        <div className="face side right" />
+        <div className="face side left" />
+        <div className="face edge top" />
+        <div className="face edge bottom" />
+        <div className="face front">
+          <div className="screen">
+            <div className="notch" />
+            <div className="pulse" />
+            <div className="glare" />
+          </div>
         </div>
       </div>
       <div className="shadow" />
@@ -150,3 +174,25 @@ function Tilt({ d, dead, status }: { d: DeviceView; dead: boolean; status: Devic
 }
 
 const clamp = (n: number) => Math.max(-80, Math.min(80, n));
+
+/** Seconds until 70 °C from a least-squares trend over the last ~15 readings (null if not rising). */
+function liveEta(hist: DeviceView["hist"]): number | null {
+  const pts = hist.slice(-15);
+  if (pts.length < 4) return null;
+  const t0 = pts[0].t;
+  const xs = pts.map((p) => (p.t - t0) / 1000);
+  const ys = pts.map((p) => p.temp);
+  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const my = ys.reduce((a, b) => a + b, 0) / ys.length;
+  let sxy = 0;
+  let sxx = 0;
+  xs.forEach((x, i) => {
+    sxy += (x - mx) * (ys[i] - my);
+    sxx += (x - mx) ** 2;
+  });
+  if (!sxx) return null;
+  const slope = sxy / sxx;
+  const latest = ys[ys.length - 1];
+  if (slope <= 0.05 || latest >= 70) return null;
+  return (70 - latest) / slope;
+}

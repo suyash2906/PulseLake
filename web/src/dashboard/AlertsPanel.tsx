@@ -9,7 +9,7 @@ const SOURCE_LABEL: Record<string, string> = {
   DEVICE_FAULT: "device",
 };
 
-export function AlertsPanel({ alerts, sound }: { alerts: Alert[]; sound: boolean }) {
+export function AlertsPanel({ alerts, sound, now }: { alerts: Alert[]; sound: boolean; now: number }) {
   const seen = useRef(new Set<string>());
   const first = useRef(true);
 
@@ -46,6 +46,9 @@ export function AlertsPanel({ alerts, sound }: { alerts: Alert[]; sound: boolean
               <span className={`al-st`}>{a.status}</span>
             </div>
             <p>{a.message}</p>
+            {a.type === "PREDICTED_OVERHEAT" && a.status === "ACTIVE" && a.etaSec !== undefined && (
+              <div className="al-eta mono">⏳ limit in ~{Math.max(0, Math.round(a.etaSec - (now - a.ts) / 1000))} s</div>
+            )}
             <small className="mono">
               {new Date(a.ts).toLocaleTimeString()} · {a.severity} · detected by {SOURCE_LABEL[a.source] ?? a.source}
             </small>

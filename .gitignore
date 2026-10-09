@@ -6,3 +6,4 @@ web/public/config.json
 .env
 __pycache__/
 .pulselake.json
+*.tsbuildinfo

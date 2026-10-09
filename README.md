@@ -50,6 +50,15 @@ Raw IoT data is stored unchanged (Bronze), processed copies in an analytics form
 curated aggregates (Gold, Athena views). Data is partitioned by date/hour, described in a central catalog
 (Glue) and queried **schema-on-read** with Athena — storage and compute are separated.
 
+### Extra capabilities
+- **Predictive early warning:** the Alert Lambda fits a trend line on the last 25 s of temperatures and raises
+  `PREDICTED_OVERHEAT` before the limit is crossed (measured: 16-17 s in advance).
+- **Time machine:** replay any past session from the Bronze layer on the dashboard at 1×-8× speed.
+- **Scalability test:** a Lambda launches up to 200 virtual devices through the same pipeline (elasticity demo,
+  hard-capped at 200 devices × 120 s, 10 runs/day).
+- **Device Shadow:** the dashboard can change a phone's data rate, reset a fault remotely, or make it flash (Locate).
+- **Scan to join:** QR code on the dashboard. A **credits meter** shows real usage from AWS Budgets.
+
 ### Two kinds of failure detection
 1. **Injected fault** (phone button: Overheat, Power Surge, Battery Critical, Sensor Freeze) → the phone
    simply sends abnormal readings → IoT Rule filter → Alert Lambda decides → red card + alarm + email.
@@ -65,7 +74,12 @@ infra/pulselake.yaml         Main CloudFormation stack
 backend/alert_processor/     Real-time failure detection (Lambda)
 backend/lake_writer/         SQS -> S3 bronze micro-batch writer (Lambda)
 backend/analytics_api/       Athena / DynamoDB API for the dashboard (Lambda URL)
+backend/lake_etl/            Bronze -> Silver (Parquet) -> Gold (views) ETL on Athena
+backend/fleet_simulator/     Virtual fleet for the scalability test (Lambda)
 backend/kill_switch/         Budget-triggered shutdown (Lambda)
+docs/report.md               Project report
+docs/demo-script.md          Step-by-step demo-day script
+docs/viva-qa.md              Viva questions and answers
 web/                         React + TypeScript: index.html (dashboard), device.html (phone)
 scripts/                     deploy / status / phase / teardown (PowerShell)
 ```
@@ -77,6 +91,7 @@ aws login --region ap-southeast-2                      # sign in (browser)
 ./scripts/deploy.ps1 -AlertEmail you@example.com      # first deploy (~10 min)
 ./scripts/status.ps1                                  # money used, phase, kill switch
 ./scripts/phase.ps1 -Phase demo                       # before demo day (cap $9 -> $22)
+./scripts/reset-data.ps1                              # wipe test data, keep the system
 ./scripts/teardown.ps1                                # after evaluation: delete everything
 ```
 

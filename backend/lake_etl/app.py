@@ -126,7 +126,25 @@ def run_sql(sql):
     return ex["Statistics"].get("DataScannedInBytes", 0)
 
 
+def has_new_data_since(ms):
+    """Cheap S3 listing of today's + yesterday's bronze partitions (no Athena cost)."""
+    newest = 0
+    for days_ago in (0, 1):
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days_ago * 86400))
+        for obj in s3.Bucket(BUCKET).objects.filter(Prefix=f"bronze/telemetry/dt={day}/"):
+            newest = max(newest, int(obj.last_modified.timestamp() * 1000))
+    return newest > ms
+
+
 def handler(event, _context):
+    if event.get("trigger") == "schedule":
+        try:
+            last = json.loads(ssm.get_parameter(Name=STATUS_PARAM)["Parameter"]["Value"])
+        except Exception:
+            last = {}
+        if last.get("state") == "SUCCEEDED" and not has_new_data_since(int(last.get("at", 0))):
+            print("scheduled run skipped: no new bronze data")
+            return {"skipped": True}
     started = time.time()
     steps = []
     scanned = 0

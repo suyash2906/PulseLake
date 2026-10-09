@@ -1,12 +1,15 @@
-// Fleet state for the dashboard, fed by live MQTT messages.
+// Fleet state for the dashboard, fed by live MQTT messages (or by the time-machine replay).
 // Plain class + useSyncExternalStore; UI notifications are throttled to ~5/s.
 import { useSyncExternalStore } from "react";
-import { SLOTS, type Alert, type DeviceEvent, type PresenceEvent, type Telemetry } from "../shared/types";
+import { SLOTS, type Alert, type DeviceEvent, type Health, type PresenceEvent, type Telemetry } from "../shared/types";
 
 export const SIGNAL_LOST_MS = 5000;
 const HISTORY = 120; // points kept per device for sparklines/charts
+const RATE_HISTORY = 120; // seconds of msgs/sec history
 
 export type DeviceStatus = "WAITING" | "OK" | "WARNING" | "FAILED" | "SIGNAL_LOST" | "OFFLINE" | "LEFT";
+export type Mode = "live" | "replay";
+export type MessageKind = "telemetry" | "abnormal" | "event" | "alert" | "alert-critical" | "presence";
 
 export interface DeviceView {
   id: string;
@@ -23,6 +26,13 @@ export interface DeviceView {
   ori: [number, number, number][]; // queue of orientation samples to replay
 }
 
+/** virtual (load-test) devices are aggregated, not shown as cards */
+export interface SimView {
+  health: Health;
+  temp: number;
+  lastAt: number;
+}
+
 export interface FeedItem {
   id: number;
   ts: number;
@@ -33,29 +43,36 @@ export interface FeedItem {
 }
 
 export interface FleetSnapshot {
+  mode: Mode;
   devices: Record<string, DeviceView>;
+  sims: Record<string, SimView>;
   feed: FeedItem[];
   alerts: Alert[];
   totalMsgs: number;
   msgsPerSec: number;
+  rateHistory: number[]; // msgs per second, oldest first
   now: number;
 }
 
 let feedSeq = 0;
+const isSim = (id: string) => id.startsWith("SIM_");
+const emptyDevices = () =>
+  Object.fromEntries(SLOTS.map((id) => [id, { id, presence: "unknown", hist: [], ori: [] } as DeviceView]));
 
 class FleetStore {
-  private devices: Record<string, DeviceView> = Object.fromEntries(
-    SLOTS.map((id) => [id, { id, presence: "unknown", hist: [], ori: [] } as DeviceView]),
-  );
+  mode: Mode = "live";
+  private devices: Record<string, DeviceView> = emptyDevices();
+  private sims: Record<string, SimView> = {};
   private feed: FeedItem[] = [];
   private alerts: Alert[] = [];
   private totalMsgs = 0;
   private recent: number[] = [];
+  private rateHistory: number[] = new Array(RATE_HISTORY).fill(0);
+  private secondCount = 0;
   private snapshot: FleetSnapshot = this.build();
   private listeners = new Set<() => void>();
+  private messageListeners = new Set<(kind: MessageKind, deviceId?: string) => void>();
   private dirty = false;
-  /** raw message hook (used by the pipeline animation) */
-  onMessage?: (kind: "telemetry" | "event" | "alert" | "presence", deviceId?: string) => void;
 
   constructor() {
     setInterval(() => {
@@ -64,6 +81,11 @@ class FleetStore {
       this.flush();
     }, 500);
     setInterval(() => this.flush(), 200);
+    setInterval(() => {
+      this.rateHistory.push(this.secondCount);
+      this.rateHistory.shift();
+      this.secondCount = 0;
+    }, 1000);
   }
 
   subscribe = (fn: () => void) => {
@@ -72,12 +94,43 @@ class FleetStore {
   };
   getSnapshot = () => this.snapshot;
 
+  /** every message (used by the pipeline animation) */
+  onMessage(fn: (kind: MessageKind, deviceId?: string) => void) {
+    this.messageListeners.add(fn);
+    return () => this.messageListeners.delete(fn);
+  }
+  private emit(kind: MessageKind, deviceId?: string) {
+    this.messageListeners.forEach((fn) => fn(kind, deviceId));
+  }
+
+  /** switch between live MQTT and the time-machine replay (clears the screen) */
+  setMode(mode: Mode) {
+    this.mode = mode;
+    this.devices = emptyDevices();
+    this.sims = {};
+    this.feed = [];
+    this.alerts = [];
+    this.recent = [];
+    this.dirty = true;
+  }
+
   private dev(id: string): DeviceView {
     return (this.devices[id] ??= { id, presence: "unknown", hist: [], ori: [] });
   }
 
   telemetry(m: Telemetry) {
     const now = Date.now();
+    this.totalMsgs++;
+    this.secondCount++;
+    this.recent.push(now);
+    const abnormal = m.health !== "OK" || m.temp > 55 || m.fault !== "NONE";
+    this.emit(abnormal ? "abnormal" : "telemetry", m.id);
+    this.dirty = true;
+
+    if (isSim(m.id)) {
+      this.sims[m.id] = { health: m.health, temp: m.temp, lastAt: now };
+      return;
+    }
     const d = this.dev(m.id);
     const wasSilent = d.lastAt === undefined || now - d.lastAt > SIGNAL_LOST_MS;
     d.last = m;
@@ -89,13 +142,9 @@ class FleetStore {
     if (d.presence !== "online") d.presence = "online"; // data proves it is connected
     d.hist.push({ t: now, temp: m.temp, vib: m.vibPeak, hum: m.hum, bat: m.bat, volt: m.volt });
     if (d.hist.length > HISTORY) d.hist.splice(0, d.hist.length - HISTORY);
-    d.ori.push(...m.ori);
+    d.ori.push(...(m.ori ?? []));
     if (d.ori.length > 60) d.ori.splice(0, d.ori.length - 60);
     if (wasSilent && d.hist.length > 1) this.push({ deviceId: m.id, tone: "ok", icon: "📶", text: `${m.id} signal restored` });
-    this.totalMsgs++;
-    this.recent.push(now);
-    this.onMessage?.("telemetry", m.id);
-    this.dirty = true;
   }
 
   event(e: DeviceEvent) {
@@ -113,7 +162,7 @@ class FleetStore {
     } else if (e.type === "FAULT_CLEARED") {
       this.push({ deviceId: e.id, tone: "ok", icon: "🛠️", text: `${e.owner} cleared ${e.fault} on ${e.id}` });
     }
-    this.onMessage?.("event", e.id);
+    this.emit("event", e.id);
     this.dirty = true;
   }
 
@@ -131,14 +180,16 @@ class FleetStore {
       d.presenceReason = p.disconnectReason;
       // browsers close sockets politely even when the app dies: only a GOODBYE means "planned"
       const graceful = d.left || p.disconnectReason === "DUPLICATE_CLIENTID";
+      // how long after the last message did AWS notice? (keep-alive measurement for the report)
+      const after = d.lastAt ? ` - detected ${Math.round((Date.now() - d.lastAt) / 1000)} s after its last message` : "";
       this.push({
         deviceId: p.clientId,
         tone: graceful ? "info" : "fail",
         icon: graceful ? "☁️" : "🚨",
-        text: `AWS IoT: ${p.clientId} disconnected (${p.disconnectReason ?? "unknown"})`,
+        text: `AWS IoT: ${p.clientId} disconnected (${p.disconnectReason ?? "unknown"})${graceful ? "" : after}`,
       });
     }
-    this.onMessage?.("presence", p.clientId);
+    this.emit("presence", p.clientId);
     this.dirty = true;
   }
 
@@ -146,8 +197,8 @@ class FleetStore {
     const i = this.alerts.findIndex((x) => x.alertId === a.alertId);
     if (i >= 0) this.alerts[i] = a;
     else this.alerts.unshift(a);
-    this.alerts = this.alerts.slice(0, 100);
-    this.onMessage?.("alert", a.deviceId);
+    this.alerts = this.alerts.slice(0, 150);
+    this.emit(a.severity === "CRITICAL" && a.status === "ACTIVE" ? "alert-critical" : "alert", a.deviceId);
     this.dirty = true;
   }
 
@@ -155,7 +206,7 @@ class FleetStore {
     const known = new Set(this.alerts.map((a) => a.alertId));
     this.alerts = [...this.alerts, ...list.filter((a) => !known.has(a.alertId))]
       .sort((a, b) => b.ts - a.ts)
-      .slice(0, 100);
+      .slice(0, 150);
     this.dirty = true;
   }
 
@@ -182,11 +233,14 @@ class FleetStore {
     const devices: Record<string, DeviceView> = {};
     for (const [k, v] of Object.entries(this.devices ?? {})) devices[k] = { ...v, hist: v.hist, ori: v.ori };
     return {
+      mode: this.mode ?? "live",
       devices,
+      sims: { ...(this.sims ?? {}) },
       feed: [...(this.feed ?? [])],
       alerts: [...(this.alerts ?? [])],
       totalMsgs: this.totalMsgs ?? 0,
       msgsPerSec: (this.recent?.length ?? 0) / 5,
+      rateHistory: [...(this.rateHistory ?? [])],
       now,
     };
   }

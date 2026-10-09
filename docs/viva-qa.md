@@ -87,6 +87,31 @@ and cheaper (Athena charges per byte scanned).
 Athena calculates partition locations (dt=…/hr=…) from rules in the table definition instead of a Glue
 crawler discovering them. No crawler runs → no crawler cost, and new data is queryable immediately.
 
+**Q: How does the early warning (prediction) work?**
+The Alert Lambda stores the last 25 seconds of each device's temperature in DynamoDB and fits a least-squares trend line.
+If the line rises faster than 0.15 °C/s and will cross 70 °C within 60 s, it raises PREDICTED_OVERHEAT. When the real
+overheat happens, the alert records the lead time. We measured 16-17 s of warning. This is the basic idea behind
+**predictive maintenance**. *(Show: press Overheat and watch the purple countdown.)*
+
+**Q: What is the time machine and why is it a data-lake feature?**
+Because Bronze keeps every raw message, Athena can pull any past window and the dashboard replays it exactly as it
+happened. A database that only stores the current state could not do that. It also lets us re-run analytics on old
+data with new rules.
+
+**Q: How do you prove the system scales?**
+The scale test launches up to 200 virtual devices from a Lambda function through the same pipeline. Messages per second
+jump from ~4 to ~200, alerts are raised for the virtual devices that fail, every message lands in S3, and we changed
+nothing. That is elasticity. *(Show: Scale test tab.)*
+
+**Q: Where is edge computing in your project?**
+On each phone. It reads the accelerometer about 60 times a second and sends only a 1-per-second summary (vibration RMS,
+peak and 10 orientation samples). That is ~98% less data than streaming raw samples.
+
+**Q: Did you use S3 storage classes (IA / Glacier)?**
+We evaluated them and decided not to. Standard-IA and Intelligent-Tiering bill every object under 128 KB as 128 KB, and
+our batch files are smaller, so tiering would cost more. Converting to compressed Parquet in Silver saves more for our
+data. Knowing when *not* to use a feature is part of cost optimisation.
+
 ## Cost & security
 
 **Q: How much does it cost?**

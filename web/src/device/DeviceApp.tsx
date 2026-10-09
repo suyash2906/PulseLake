@@ -182,6 +182,9 @@ function LiveScreen({ engine, onLeave }: { engine: DeviceEngine; onLeave: () => 
         <div className="dv-banner">Going to sleep in {s.sleepInSeconds}s to save credits. Tap anywhere to stay awake.</div>
       )}
 
+      {!s.real && s.sent > 3 && <MotionHint />}
+      <StuckHint conn={s.conn} />
+
       <HealthRing health={s.health} label={HEALTH_LABEL[s.health]} sub={activeFault ? `${activeFault.icon} ${activeFault.label}` : "All systems normal"} />
 
       <div className="dv-metrics">
@@ -256,6 +259,55 @@ function LiveScreen({ engine, onLeave }: { engine: DeviceEngine; onLeave: () => 
           <p>{s.connDetail}. Pick another slot.</p>
           <button className="dv-cta" onClick={onLeave}>Back</button>
         </Overlay>
+      )}
+    </div>
+  );
+}
+
+/** If AWS IoT cannot be reached for 15 s, explain the likely reasons. */
+function StuckHint({ conn }: { conn: string }) {
+  const [since, setSince] = useState<number | null>(null);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    setSince(conn === "online" || conn === "blocked" ? null : Date.now());
+  }, [conn]);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (since === null || Date.now() - since < 15_000) return null;
+  return (
+    <div className="dv-banner">
+      Can't reach AWS IoT. Check the phone's internet (try mobile data / hotspot). If it still fails, the project may be
+      paused by the budget kill switch.
+    </div>
+  );
+}
+
+/** Shown while the phone sends simulated motion - usually missing iPhone permission. */
+function MotionHint() {
+  const [tried, setTried] = useState(false);
+  const iosPrompt = typeof (window as any).DeviceMotionEvent?.requestPermission === "function";
+  return (
+    <div className="dv-banner motion">
+      <b>Motion sensors are off</b> - this phone is sending simulated tilt/vibration.
+      {iosPrompt ? (
+        <button
+          onClick={async () => {
+            await requestMotionPermission();
+            setTried(true);
+          }}
+        >
+          Enable motion sensors
+        </button>
+      ) : (
+        <span> This browser does not expose motion sensors.</span>
+      )}
+      {tried && (
+        <small>
+          No prompt? On iPhone: Settings → Apps → Safari → Advanced → turn on "Motion & Orientation Access", then reload this
+          page.
+        </small>
       )}
     </div>
   );

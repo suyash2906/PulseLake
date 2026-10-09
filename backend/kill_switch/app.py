@@ -2,8 +2,9 @@
 
 Triggered by AWS Budgets (via SNS) when the project's real usage cost crosses a threshold.
 If the cost is at/over the cap for the current phase (testing or demo) it:
-  1. disables every IoT topic rule named pulselake_*  -> no more Firehose/Lambda work
-  2. attaches an explicit Deny iot:* policy to the Cognito guest role -> phones and
+  1. disables every IoT topic rule named pulselake_*  -> no more SQS/Lambda/S3 work
+  2. blocks the virtual-fleet simulator (reserved concurrency 0)
+  3. attaches an explicit Deny iot:* policy to the Cognito guest role -> phones and
      dashboard can no longer connect/publish
 Re-enabling is deliberately manual: scripts/phase.ps1.
 
@@ -60,6 +61,11 @@ def kill(reason: str) -> dict:
         token = page.get("nextToken")
         if not token:
             break
+
+    # stop the virtual-fleet load test from being started (reserved concurrency 0 = cannot run)
+    sim = os.environ.get("SIM_FUNCTION_NAME")
+    if sim:
+        boto3.client("lambda").put_function_concurrency(FunctionName=sim, ReservedConcurrentExecutions=0)
 
     iam.put_role_policy(
         RoleName=GUEST_ROLE,

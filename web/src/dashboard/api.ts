@@ -41,7 +41,52 @@ export interface LakeLayer {
   newestAt: string | null;
 }
 
+export interface Session {
+  start: number;
+  end: number;
+  messages: number;
+  devices: number;
+  owners: string[];
+}
+
+export interface ReplayData {
+  start: number;
+  end: number;
+  telemetry: import("../shared/types").Telemetry[];
+  events: import("../shared/types").DeviceEvent[];
+  alerts: (Alert & { at: number })[];
+  queryMs: number;
+}
+
+export interface SimStatus {
+  state: "NEVER_RUN" | "STARTING" | "RUNNING" | "DONE";
+  at?: number;
+  devices?: number;
+  seconds?: number;
+  sent?: number;
+  errors?: number;
+  elapsed?: number;
+  faultyDevices?: number;
+  durationSec?: number;
+  runsToday?: number;
+}
+
+export interface CostInfo {
+  capUsd: number;
+  usedUsd?: number;
+  forecastUsd?: number;
+  creditsLeftUsd?: number;
+  plan?: string;
+  phase: string;
+  phaseCapUsd: number;
+}
+
 export const api = {
+  sessions: () => get<{ sessions: Session[] }>("/sessions").then((r) => r.sessions),
+  replay: (start: number, end: number) => get<ReplayData>(`/replay?start=${start}&end=${end}`),
+  simulate: (devices: number, seconds: number) => post<SimStatus>("/simulate", { devices, seconds }),
+  simulateStatus: () => get<SimStatus>("/simulate/status"),
+  cost: () => get<CostInfo>("/cost"),
   alerts: () => get<{ alerts: Alert[] }>("/alerts").then((r) => r.alerts),
   fleet: () => get<{ devices: any[] }>("/fleet").then((r) => r.devices),
   queries: () => get<{ queries: { name: string; title: string; layer: string }[] }>("/queries").then((r) => r.queries),

@@ -93,6 +93,9 @@ export interface Alert {
   status: "ACTIVE" | "RESOLVED";
   message: string;
   source: "DEVICE_FAULT" | "CLOUD_RULE" | "PRESENCE";
+  etaSec?: number; // PREDICTED_OVERHEAT: seconds until the limit, at alert time
+  predictedLeadSec?: number; // OVERHEAT: how long before it the cloud predicted it
+  resolvedAt?: number;
 }
 
 /** AWS-generated lifecycle event on $aws/events/presence/{connected|disconnected}/{clientId} */
