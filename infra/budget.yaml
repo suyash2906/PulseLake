@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PulseLake - cost safety stack (deployed FIRST, before any paid resource).
+  One AWS Budget that tracks real usage cost (credits excluded) with email alerts,
+  plus an SNS topic that the kill-switch Lambda (main stack) subscribes to.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email that receives budget warnings
+  TotalCapUsd:
+    Type: Number
+    Default: 25
+    Description: Hard project cap in USD (paid only from AWS credits)
+  BudgetStartEpoch:
+    Type: String
+    Default: "1790812800" # 2026-10-01T00:00:00Z - budget accumulates for 12 months from here
+
+Resources:
+  BudgetAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: pulselake-budget-alerts
+      DisplayName: PulseLake budget alerts
+
+  BudgetAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref BudgetAlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal: { Service: budgets.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertsTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  ProjectBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: BudgetAlertsTopicPolicy
+    Properties:
+      Budget:
+        BudgetName: pulselake-total-cap
+        BudgetType: COST
+        TimeUnit: ANNUALLY
+        TimePeriod:
+          Start: !Ref BudgetStartEpoch
+        BudgetLimit:
+          Amount: !Ref TotalCapUsd
+          Unit: USD
+        CostTypes:
+          # Excluding credits means the budget shows the REAL usage cost
+          # (i.e. how much of the credits we are burning), not the $0 bill.
+          IncludeCredit: false
+          IncludeRefund: false
+          IncludeTax: true
+          IncludeSubscription: true
+          IncludeRecurring: true
+          IncludeOtherSubscription: true
+          IncludeSupport: true
+          IncludeDiscount: true
+          IncludeUpfront: true
+          UseBlended: false
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 5, ThresholdType: ABSOLUTE_VALUE }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - { SubscriptionType: SNS, Address: !Ref BudgetAlertsTopic }
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 8, ThresholdType: ABSOLUTE_VALUE }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - { SubscriptionType: SNS, Address: !Ref BudgetAlertsTopic }
+        # $9 = testing-phase cap (kill switch fires while phase=testing)
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 9, ThresholdType: ABSOLUTE_VALUE }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - { SubscriptionType: SNS, Address: !Ref BudgetAlertsTopic }
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 18, ThresholdType: ABSOLUTE_VALUE }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - { SubscriptionType: SNS, Address: !Ref BudgetAlertsTopic }
+        # $22 = demo-phase cap (kill switch fires in any phase) - leaves $3 margin for billing delay
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 22, ThresholdType: ABSOLUTE_VALUE }
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+            - { SubscriptionType: SNS, Address: !Ref BudgetAlertsTopic }
+
+Outputs:
+  BudgetAlertsTopicArn:
+    Value: !Ref BudgetAlertsTopic
+    Export: { Name: pulselake-budget-alerts-topic }
+  BudgetName:
+    Value: pulselake-total-cap

@@ -1,0 +1,912 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PulseLake - real-time IoT data lake on AWS. Phones (IoT Things PHONE_01..04) stream
+  MQTT to AWS IoT Core; the dashboard is hosted on S3 + CloudFront. Serverless only:
+  nothing in this stack costs money while idle.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: pulselake
+  TestingCapUsd:
+    Type: String
+    Default: "9"
+  DemoCapUsd:
+    Type: String
+    Default: "22"
+  AlertEmail:
+    Type: String
+    Description: Receives CRITICAL device alerts (SNS email, confirm the subscription mail)
+
+Resources:
+  # ------------------------------------------------------------------ hosting (HTTPS)
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-web-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-web-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: PulseLake dashboard + phone app
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200 # includes India edge locations
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebOriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https # sensors need HTTPS
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: /config.json
+            TargetOriginId: web
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+
+  # ------------------------------------------------------------------ device identity
+  # Phones and the dashboard get short-lived guest credentials from Cognito.
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub "${ProjectName}_guests"
+      AllowUnauthenticatedIdentities: true
+      AllowClassicFlow: false
+
+  GuestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-guest-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: cognito-identity.amazonaws.com }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: { "cognito-identity.amazonaws.com:aud": !Ref IdentityPool }
+              ForAnyValue:StringLike: { "cognito-identity.amazonaws.com:amr": unauthenticated }
+      Policies:
+        - PolicyName: iot-pulselake-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ConnectAsPhoneOrDashboard
+                Effect: Allow
+                Action: iot:Connect
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/PHONE_0*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/dash-*"
+              - Sid: PublishDeviceTopics
+                Effect: Allow
+                Action: iot:Publish
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*"
+              - Sid: SubscribeProjectAndPresence
+                Effect: Allow
+                Action: iot:Subscribe
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/pulselake/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/events/presence/*"
+              - Sid: ReceiveProjectAndPresence
+                Effect: Allow
+                Action: iot:Receive
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/events/presence/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/PHONE_0*/shadow/*"
+              - Sid: DeviceShadow
+                Effect: Allow
+                Action: [iot:Publish, iot:Subscribe]
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/PHONE_0*/shadow/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/PHONE_0*/shadow/*"
+
+  IdentityPoolRoles:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        unauthenticated: !GetAtt GuestRole.Arn
+
+  # ------------------------------------------------------------------ IoT Thing registry
+  Phone01:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: PHONE_01
+      AttributePayload: { Attributes: { project: !Ref ProjectName, kind: smartphone, slot: "1" } }
+  Phone02:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: PHONE_02
+      AttributePayload: { Attributes: { project: !Ref ProjectName, kind: smartphone, slot: "2" } }
+  Phone03:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: PHONE_03
+      AttributePayload: { Attributes: { project: !Ref ProjectName, kind: smartphone, slot: "3" } }
+  Phone04:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: PHONE_04
+      AttributePayload: { Attributes: { project: !Ref ProjectName, kind: smartphone, slot: "4" } }
+
+  # ------------------------------------------------------------------ cost safety
+  PhaseParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/phase"
+      Type: String
+      Value: testing
+      Description: testing (cap $9) or demo (cap $22) - change only with scripts/phase.ps1
+
+  KillStatusParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/kill-status"
+      Type: String
+      Value: ARMED
+
+  KillSwitchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: kill-switch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iot:ListTopicRules
+                Resource: "*"
+              - Effect: Allow
+                Action: iot:DisableTopicRule
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}_*"
+              - Effect: Allow
+                Action: iam:PutRolePolicy
+                Resource: !GetAtt GuestRole.Arn
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*"
+
+  KillSwitchLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-kill-switch"
+      RetentionInDays: 7
+
+  KillSwitchFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: KillSwitchLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-kill-switch"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/kill_switch
+      Role: !GetAtt KillSwitchRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          GUEST_ROLE_NAME: !Ref GuestRole
+          PHASE_PARAM: !Ref PhaseParameter
+          STATUS_PARAM: !Ref KillStatusParameter
+          TESTING_CAP: !Ref TestingCapUsd
+          DEMO_CAP: !Ref DemoCapUsd
+
+  KillSwitchSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !ImportValue pulselake-budget-alerts-topic
+      Protocol: lambda
+      Endpoint: !GetAtt KillSwitchFunction.Arn
+
+  KillSwitchInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KillSwitchFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !ImportValue pulselake-budget-alerts-topic
+
+  # ================================================================== PHASE 2: failure detection
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-devices"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: deviceId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: deviceId, KeyType: HASH }
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-alerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-device-alerts"
+      DisplayName: PulseLake alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: alert-processor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: [!GetAtt DevicesTable.Arn, !GetAtt AlertsTable.Arn]
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: iot:DescribeEndpoint
+                Resource: "*"
+              - Effect: Allow
+                Action: iot:Publish
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/alerts"
+
+  AlertProcessorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-alert-processor"
+      RetentionInDays: 7
+
+  AlertProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AlertProcessorLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-alert-processor"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/alert_processor
+      Role: !GetAtt AlertProcessorRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEVICES_TABLE: !Ref DevicesTable
+          ALERTS_TABLE: !Ref AlertsTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+
+  # Real-time alerts must never be replayed minutes later: no async retries, drop stale events.
+  AlertProcessorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref AlertProcessorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 60
+
+  AlertProcessorIotPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}_*"
+
+  # Role the IoT Rules Engine uses for SQS / S3 / error republish actions
+  IotRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: iot.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: iot-rule-actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${LakeBucket.Arn}/bronze/*"
+              - Effect: Allow
+                Action: iot:Publish
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/rule-errors"
+
+  # Edge filtering: only abnormal readings + every 5th message (heartbeat sample) reach Lambda.
+  RuleTelemetryAlerts:
+    Type: AWS::IoT::TopicRule
+    DependsOn: AlertProcessorIotPermission
+    Properties:
+      RuleName: !Sub "${ProjectName}_telemetry_alerts"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: Abnormal telemetry (or heartbeat sample) -> alert processor
+        Sql: >-
+          SELECT *, 'telemetry' AS kind FROM 'pulselake/devices/+/telemetry'
+          WHERE fault <> 'NONE' OR health <> 'OK' OR temp > 70 OR volt > 6 OR bat < 10
+          OR vibPeak > 15 OR seq % 5 = 0
+        RuleDisabled: false
+        Actions:
+          - Lambda: { FunctionArn: !GetAtt AlertProcessorFunction.Arn }
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
+  RulePresence:
+    Type: AWS::IoT::TopicRule
+    DependsOn: AlertProcessorIotPermission
+    Properties:
+      RuleName: !Sub "${ProjectName}_presence"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: AWS lifecycle events of phones -> alert processor (real offline detection)
+        Sql: >-
+          SELECT *, 'presence' AS kind FROM '$aws/events/presence/+/+'
+          WHERE startswith(clientId, 'PHONE_')
+        RuleDisabled: false
+        Actions:
+          - Lambda: { FunctionArn: !GetAtt AlertProcessorFunction.Arn }
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
+  RuleDeviceEvents:
+    Type: AWS::IoT::TopicRule
+    DependsOn: AlertProcessorIotPermission
+    Properties:
+      RuleName: !Sub "${ProjectName}_device_events"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: Device events -> registry update + raw archive in the lake
+        Sql: "SELECT *, 'event' AS kind, timestamp() AS ingest_ts FROM 'pulselake/devices/+/events'"
+        RuleDisabled: false
+        Actions:
+          - Lambda: { FunctionArn: !GetAtt AlertProcessorFunction.Arn }
+          - S3:
+              BucketName: !Ref LakeBucket
+              RoleArn: !GetAtt IotRuleRole.Arn
+              Key: bronze/events/dt=${parse_time("yyyy-MM-dd", timestamp(), "UTC")}/${timestamp()}-${newuuid()}.json
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
+  # ================================================================== PHASE 3: data lake
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-lake-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+  # Ingestion buffer (Firehose/Kinesis are not available on the AWS Free plan):
+  # IoT Rule -> SQS queue -> Lambda "lake writer" invoked once per ~60 s with the whole
+  # batch -> ONE JSON-lines file per minute in S3 (avoids the tiny-file problem).
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-ingest"
+      MessageRetentionPeriod: 86400 # 1 day
+      VisibilityTimeout: 420 # > 6 x writer timeout + batching window
+      SqsManagedSseEnabled: true
+
+  LakeWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lake-writer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${LakeBucket.Arn}/bronze/telemetry/*"
+
+  LakeWriterLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-lake-writer"
+      RetentionInDays: 7
+
+  LakeWriterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LakeWriterLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-lake-writer"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/lake_writer
+      Role: !GetAtt LakeWriterRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          LAKE_BUCKET: !Ref LakeBucket
+
+  LakeWriterTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref LakeWriterFunction
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      BatchSize: 10000
+      MaximumBatchingWindowInSeconds: 60
+      Enabled: true
+
+  RuleBronzeTelemetry:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub "${ProjectName}_bronze_telemetry"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: Every telemetry message -> SQS -> lake writer -> S3 bronze (raw + ingest metadata)
+        Sql: "SELECT *, topic(3) AS thing, timestamp() AS ingest_ts FROM 'pulselake/devices/+/telemetry'"
+        RuleDisabled: false
+        Actions:
+          - Sqs:
+              QueueUrl: !Ref IngestQueue
+              RoleArn: !GetAtt IotRuleRole.Arn
+              UseBase64: false
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
+  RuleAlertArchive:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub "${ProjectName}_alert_archive"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: Every alert (opened/resolved) -> S3 bronze/alerts
+        Sql: "SELECT * FROM 'pulselake/alerts'"
+        RuleDisabled: false
+        Actions:
+          - S3:
+              BucketName: !Ref LakeBucket
+              RoleArn: !GetAtt IotRuleRole.Arn
+              Key: bronze/alerts/dt=${parse_time("yyyy-MM-dd", timestamp(), "UTC")}/${timestamp()}-${newuuid()}.json
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
+  # Glue Data Catalog - schema-on-read. Partition projection = no crawler needed (no cost).
+  LakeDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_lake"
+        Description: PulseLake IoT data lake (bronze / silver / gold)
+
+  BronzeTelemetryTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: bronze_telemetry
+        Description: Raw phone telemetry exactly as received (JSON lines)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          projection.hr.type: integer
+          projection.hr.range: "0,23"
+          projection.hr.digits: "2"
+          storage.location.template: !Sub "s3://${LakeBucket}/bronze/telemetry/dt=${!dt}/hr=${!hr}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+          - { Name: hr, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/bronze/telemetry/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: id, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: profile, Type: string }
+            - { Name: seq, Type: bigint }
+            - { Name: ts, Type: bigint }
+            - { Name: rate, Type: double }
+            - { Name: health, Type: string }
+            - { Name: fault, Type: string }
+            - { Name: temp, Type: double }
+            - { Name: hum, Type: double }
+            - { Name: volt, Type: double }
+            - { Name: bat, Type: int }
+            - { Name: chg, Type: boolean }
+            - { Name: vib, Type: double }
+            - { Name: vibpeak, Type: double }
+            - { Name: acc, Type: "array<double>" }
+            - { Name: sensors, Type: string }
+            - { Name: thing, Type: string }
+            - { Name: ingest_ts, Type: bigint }
+
+  BronzeEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: bronze_events
+        Description: Raw device events (joins, leaves, injected faults)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${LakeBucket}/bronze/events/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/bronze/events/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: id, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: profile, Type: string }
+            - { Name: ts, Type: bigint }
+            - { Name: type, Type: string }
+            - { Name: fault, Type: string }
+            - { Name: health, Type: string }
+            - { Name: ingest_ts, Type: bigint }
+
+  BronzeAlertsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: bronze_alerts
+        Description: Every alert the cloud raised or resolved
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${LakeBucket}/bronze/alerts/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/bronze/alerts/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: alertid, Type: string }
+            - { Name: deviceid, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: ts, Type: bigint }
+            - { Name: type, Type: string }
+            - { Name: severity, Type: string }
+            - { Name: status, Type: string }
+            - { Name: message, Type: string }
+            - { Name: source, Type: string }
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref ProjectName
+      Description: PulseLake analytics - every query capped at 100 MB scanned
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: 104857600
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LakeBucket}/athena-results/"
+
+  # The ETL needs CTAS with its own external_location (silver/), which an enforced
+  # workgroup forbids - so it gets its own workgroup with the same 100 MB scan cap.
+  EtlWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-etl"
+      Description: PulseLake ETL (bronze -> silver -> gold), capped at 100 MB per query
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: 104857600
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LakeBucket}/athena-results/etl/"
+
+  AnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: analytics-read-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:Query, dynamodb:GetItem]
+                Resource: [!GetAtt DevicesTable.Arn, !GetAtt AlertsTable.Arn]
+              - Effect: Allow
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults,
+                         athena:StopQueryExecution]
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions]
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LakeDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LakeDatabase}/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${LakeBucket.Arn}/athena-results/*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LakeEtlFunction.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/etl-status"
+
+  # ================================================================== PHASE 4: silver / gold ETL
+  EtlStatusParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/etl-status"
+      Type: String
+      Value: '{"state":"NEVER_RUN"}'
+
+  LakeEtlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lake-etl
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults,
+                         athena:StopQueryExecution]
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${EtlWorkGroup}"
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions,
+                         glue:CreateTable, glue:UpdateTable, glue:DeleteTable, glue:BatchCreatePartition,
+                         glue:CreatePartition, glue:BatchDeletePartition, glue:DeletePartition]
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LakeDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LakeDatabase}/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation, s3:ListBucketMultipartUploads,
+                         s3:ListMultipartUploadParts, s3:AbortMultipartUpload]
+                Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub "${LakeBucket.Arn}/silver/*", !Sub "${LakeBucket.Arn}/athena-results/*"]
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/etl-status"
+
+  LakeEtlLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-lake-etl"
+      RetentionInDays: 7
+
+  LakeEtlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LakeEtlLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-lake-etl"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/lake_etl
+      Role: !GetAtt LakeEtlRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          ATHENA_WORKGROUP: !Ref EtlWorkGroup
+          GLUE_DATABASE: !Ref LakeDatabase
+          LAKE_BUCKET: !Ref LakeBucket
+          ETL_STATUS_PARAM: !Ref EtlStatusParameter
+
+  AnalyticsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-analytics-api"
+      RetentionInDays: 7
+
+  AnalyticsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AnalyticsLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-analytics-api"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/analytics_api
+      Role: !GetAtt AnalyticsRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEVICES_TABLE: !Ref DevicesTable
+          ALERTS_TABLE: !Ref AlertsTable
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+          GLUE_DATABASE: !Ref LakeDatabase
+          LAKE_BUCKET: !Ref LakeBucket
+          ETL_FUNCTION: !Ref LakeEtlFunction
+          ETL_STATUS_PARAM: !Ref EtlStatusParameter
+
+  AnalyticsUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt AnalyticsFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST]
+        AllowHeaders: [content-type]
+        MaxAge: 3600
+
+  AnalyticsUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyticsFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # Since Oct 2025 public function URLs also need InvokeFunction (restricted to URL calls).
+  AnalyticsUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  AnalyticsUrl:
+    Value: !GetAtt AnalyticsUrl.FunctionUrl
+  LakeBucketName:
+    Value: !Ref LakeBucket
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+  GlueDatabaseName:
+    Value: !Ref LakeDatabase
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+  GuestRoleName:
+    Value: !Ref GuestRole
+  WebBucketName:
+    Value: !Ref WebBucket
+  DistributionId:
+    Value: !Ref WebDistribution
+  WebUrl:
+    Value: !Sub "https://${WebDistribution.DomainName}"
+  KillSwitchFunctionName:
+    Value: !Ref KillSwitchFunction
