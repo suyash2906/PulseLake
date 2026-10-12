@@ -1,5 +1,7 @@
-import { memo, useEffect, useRef } from "react";
-import { FAULTS, PROFILES, type Alert } from "../shared/types";
+import { memo, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { cssMatrix3d, headingRad, readout, recenter, slerp, type Quat } from "../shared/quat";
+import { FAULTS, profileOf, type Alert } from "../shared/types";
 import { setDesired } from "./live";
 import { Sparkline } from "./Sparkline";
 import { statusOf, type DeviceStatus, type DeviceView } from "./store";
@@ -15,20 +17,26 @@ const STATUS_META: Record<DeviceStatus, { label: string; tone: string }> = {
 };
 
 export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: { d: DeviceView; now: number; joinUrl: string; alerts: Alert[] }) {
+  const [enlarged, setEnlarged] = useState(false);
   const status = statusOf(d, now);
-  const prediction = alerts.find((a) => a.deviceId === d.id && a.type === "PREDICTED_OVERHEAT" && a.status === "ACTIVE");
-  const confirmed = alerts.find((a) => a.deviceId === d.id && a.type === "OVERHEAT" && a.status === "ACTIVE" && a.predictedLeadSec);
+  const mine = alerts.filter((a) => a.deviceId === d.id && a.status === "ACTIVE");
+  const prediction = mine.find((a) => a.type === "PREDICTED_OVERHEAT");
+  const confirmed = mine.find((a) => a.type === "OVERHEAT" && a.predictedLeadSec);
+  const fall = mine.find((a) => a.type === "FALL");
+  const sos = mine.find((a) => a.type === "SOS");
+  const emergency = fall ?? sos;
   // the cloud raises the warning; the countdown is re-estimated live from the newest readings
   const eta = prediction ? liveEta(d.hist) ?? Math.max(0, (prediction.etaSec ?? 0) - (now - prediction.ts) / 1000) : null;
-  const meta = STATUS_META[status];
+  const meta = emergency ? { label: fall ? "FALL" : "SOS", tone: "fail" } : STATUS_META[status];
   const t = d.last;
-  const profile = PROFILES.find((p) => p.key === d.profile);
+  const profile = profileOf(d.profile);
   const fault = FAULTS.find((f) => f.key === t?.fault);
   const ago = d.lastAt ? Math.round((now - d.lastAt) / 1000) : null;
   const dead = status === "OFFLINE" || status === "SIGNAL_LOST" || status === "LEFT";
+  const hasNoise = d.hist.some((h) => h.noise !== null);
 
   return (
-    <article className={`card dev st-${status.toLowerCase()} tone-${meta.tone}`}>
+    <article className={`card dev st-${status.toLowerCase()} tone-${meta.tone} ${emergency ? "emergency" : ""}`}>
       <header>
         <div className="dev-title">
           <span className="dev-ico">{profile?.icon ?? "📱"}</span>
@@ -37,7 +45,7 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
             <small>{d.owner ? `${d.owner} · ${profile?.label ?? d.profile}` : "no device yet"}</small>
           </div>
         </div>
-        <span className={`pill ${meta.tone} ${status === "OK" ? "live" : ""}`}>
+        <span className={`pill ${meta.tone} ${status === "OK" && !emergency ? "live" : ""}`}>
           <span className="dot" />
           {meta.label}
         </span>
@@ -52,16 +60,24 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
         </div>
       ) : (
         <>
+          {emergency && (
+            <div className="dev-emergency">
+              <b>{fall ? "🚨 FALL DETECTED" : "🆘 SOS"}</b>
+              <span>{emergency.message}</span>
+              <small className="mono">{new Date(emergency.ts).toLocaleTimeString()} · detected on the phone, alert by the cloud</small>
+            </div>
+          )}
           <div className="dev-body">
-            <Tilt d={d} dead={dead} status={status} />
+            <OrientationTwin d={d} dead={dead} status={status} onOpen={() => setEnlarged(true)} />
             <div className="dev-metrics">
               <M label="Temp" value={t ? `${t.temp.toFixed(1)}°C` : "–"} hot={!!t && t.temp > 70} />
               <M label="Humidity" value={t ? `${t.hum.toFixed(0)}%` : "–"} />
               <M label="Battery" value={t ? `${t.bat}%${t.chg ? " ⚡" : ""}` : "–"} hot={!!t && t.bat < 10} />
               <M label="Voltage" value={t ? `${t.volt.toFixed(2)}V` : "–"} hot={!!t && t.volt > 6} />
+              <NoiseMeterCell db={t?.noise ?? null} />
             </div>
           </div>
-          <div className="dev-charts">
+          <div className={`dev-charts ${hasNoise ? "three" : ""}`}>
             <div>
               <span className="lbl">Vibration m/s²</span>
               <Sparkline values={d.hist.map((h) => h.vib)} color="#4cc9f0" min={0} max={20} threshold={15} />
@@ -70,6 +86,12 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
               <span className="lbl">Temperature °C</span>
               <Sparkline values={d.hist.map((h) => h.temp)} color="#ff9f43" threshold={70} />
             </div>
+            {hasNoise && (
+              <div>
+                <span className="lbl">Noise dB(A)</span>
+                <Sparkline values={d.hist.map((h) => h.noise ?? 0)} color="#b388ff" min={30} max={110} threshold={85} />
+              </div>
+            )}
           </div>
           {eta !== null && !dead && (
             <div className="dev-predict">
@@ -111,7 +133,20 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
         </>
       )}
       {status === "SIGNAL_LOST" && <div className="noise" />}
-      {status === "FAILED" && <div className="scan" />}
+      {(status === "FAILED" || emergency) && <div className="scan" />}
+      {enlarged &&
+        createPortal(
+          <div className="twin-overlay" onClick={() => setEnlarged(false)}>
+            <div className="twin-card" onClick={(e) => e.stopPropagation()}>
+              <h2>
+                {profile?.icon} {d.id.replace("_", " ")} · {d.owner} <small>3D twin, about 1 s behind the real phone</small>
+              </h2>
+              <OrientationTwin d={d} dead={dead} status={status} big />
+              <button className="etl-btn" onClick={() => setEnlarged(false)}>Close</button>
+            </div>
+          </div>,
+          document.body,
+        )}
     </article>
   );
 });
@@ -125,55 +160,100 @@ function M({ label, value, hot }: { label: string; value: string; hot?: boolean 
   );
 }
 
-/** CSS-3D phone that replays the batched orientation samples smoothly. */
-function Tilt({ d, dead, status }: { d: DeviceView; dead: boolean; status: DeviceStatus }) {
+/** Wide metric cell with a bar from 30 to 110 dB(A); the 85 dB(A) limit is marked. */
+function NoiseMeterCell({ db }: { db: number | null }) {
+  const pct = db === null ? 0 : Math.min(100, Math.max(0, ((db - 30) / 80) * 100));
+  const tone = db === null ? "off" : db >= 85 ? "fail" : db >= 70 ? "warn" : "ok";
+  return (
+    <div className={`m wide noise-m t-${tone}`}>
+      <span>Noise {db === null ? "(mic off)" : "approx. dB(A)"}</span>
+      <b className="mono">{db === null ? "–" : db.toFixed(0)}</b>
+      <div className="nbar">
+        <i style={{ width: `${pct}%` }} />
+        <em style={{ left: `${((85 - 30) / 80) * 100}%` }} title="85 dB(A) limit" />
+      </div>
+    </div>
+  );
+}
+
+// Re-center reference (yaw) per device, kept across re-renders and the enlarged view.
+const yawRefs = new Map<string, number>();
+
+/**
+ * 3D twin: plays the phone's timestamped orientation samples about 1.2 s after they were
+ * measured, interpolating between neighbours with SLERP every frame. True angles - no
+ * scaling, clamping or offsets; the viewing angle is a separate camera transform.
+ */
+function OrientationTwin({ d, dead, status, big, onOpen }: { d: DeviceView; dead: boolean; status: DeviceStatus; big?: boolean; onOpen?: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
-  const cur = useRef({ beta: 0, gamma: 0 });
+  const readRef = useRef<HTMLDivElement>(null);
+  const cur = useRef<Quat | null>(null);
+
   useEffect(() => {
     let raf = 0;
-    let lastPop = 0;
-    const tick = (t: number) => {
-      // pop one sample every 100 ms (samples were captured at 10 Hz)
-      if (t - lastPop > 100 && d.ori.length > 3) {
-        lastPop = t;
-        const s = d.ori.shift();
-        if (s) {
-          cur.current.beta += (clamp(s[1]) - cur.current.beta) * 0.5;
-          cur.current.gamma += (clamp(s[2]) - cur.current.gamma) * 0.5;
-        }
+    let lastText = 0;
+    const tick = (frame: number) => {
+      const now = Date.now();
+      const buf = d.pose;
+      while (buf.length >= 2 && buf[1].t <= now) buf.shift(); // samples already passed
+      let q: Quat | null = null;
+      if (buf.length >= 2 && buf[0].t <= now) {
+        const a = buf[0];
+        const b = buf[1];
+        q = slerp(a.q, b.q, (now - a.t) / Math.max(1, b.t - a.t));
+      } else if (buf.length && (buf[0].t <= now || !cur.current)) {
+        q = buf[0].q;
       }
-      if (ref.current) {
-        // small base angle so the phone's thickness is visible even when it lies flat
-        ref.current.style.transform = `rotateX(${10 + cur.current.beta * 0.6}deg) rotateY(${-18 + cur.current.gamma * 0.8}deg)`;
+      if (q) {
+        cur.current = q;
+        if (!yawRefs.has(d.id)) yawRefs.set(d.id, headingRad(q)); // first pose faces the viewer
+        if (ref.current) ref.current.style.transform = cssMatrix3d(recenter(q, yawRefs.get(d.id)!));
+        if (readRef.current && frame - lastText > 150) {
+          lastText = frame;
+          const o = readout(q); // raw angles: identical to the readout on the phone itself
+          readRef.current.textContent = `F/B ${Math.round(o.frontBack)}° · L/R ${Math.round(o.leftRight)}° · H ${Math.round(o.heading)}°`;
+        }
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [d]);
+
+  const recenterNow = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (cur.current) yawRefs.set(d.id, headingRad(cur.current));
+  };
+
   return (
-    <div className="tilt-stage">
-      <div ref={ref} className={`phone3d ${dead ? "dead" : ""} ps-${status.toLowerCase()}`}>
-        {/* six faces = a phone with real thickness */}
-        <div className="face back"><span className="cam" /></div>
-        <div className="face side right" />
-        <div className="face side left" />
-        <div className="face edge top" />
-        <div className="face edge bottom" />
-        <div className="face front">
-          <div className="screen">
-            <div className="notch" />
-            <div className="pulse" />
-            <div className="glare" />
+    <div className={`twin ${big ? "big" : ""}`}>
+      <div className="tilt-stage" onClick={onOpen} title={onOpen ? "Click to enlarge" : undefined}>
+        <div className="twin-cam">
+          <div ref={ref} className={`phone3d ${dead ? "dead" : ""} ps-${status.toLowerCase()}`}>
+            {/* six faces = a phone with real thickness */}
+            <div className="face back"><span className="cam" /></div>
+            <div className="face side right" />
+            <div className="face side left" />
+            <div className="face edge top" />
+            <div className="face edge bottom" />
+            <div className="face front">
+              <div className="screen">
+                <div className="notch" />
+                <div className="pulse" />
+                <div className="glare" />
+              </div>
+            </div>
           </div>
         </div>
+        <div className="shadow" />
       </div>
-      <div className="shadow" />
+      <div className="twin-read">
+        <span ref={readRef} className="mono">waiting for pose…</span>
+        <button title="Make the phone's current direction face you" onClick={recenterNow}>⟲ Re-center</button>
+      </div>
     </div>
   );
 }
-
-const clamp = (n: number) => Math.max(-80, Math.min(80, n));
 
 /** Seconds until 70 °C from a least-squares trend over the last ~15 readings (null if not rising). */
 function liveEta(hist: DeviceView["hist"]): number | null {

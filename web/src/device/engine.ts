@@ -11,9 +11,12 @@ import {
   type Profile,
   type Telemetry,
 } from "../shared/types";
+import { readout } from "../shared/quat";
+import { FallDetector, type FallEventInfo } from "./fall";
+import { NoiseMeter } from "./noise";
 import { Sensors, round } from "./sensors";
 
-export type Overlay = null | "CRASH" | "NETWORK_DROP" | "SLEEP" | "LOCATE";
+export type Overlay = null | "CRASH" | "NETWORK_DROP" | "SLEEP" | "LOCATE" | "FALL_COUNTDOWN" | "FALL_SENT";
 
 export interface EngineState {
   conn: ConnState;
@@ -27,7 +30,13 @@ export interface EngineState {
   chg: boolean;
   vib: number;
   vibPeak: number;
-  tilt: [number, number];
+  orient: { frontBack: number; leftRight: number; heading: number };
+  fallCountdown: number; // seconds left on "Are you OK?"
+  fallInfo: FallEventInfo | null;
+  sos: boolean;
+  noiseOn: boolean;
+  noiseLevel: number | null; // live approx. dB(A)
+  noiseError: string;
   sent: number;
   real: boolean;
   rate: number;
@@ -39,6 +48,7 @@ export interface EngineState {
 const SLEEP_AFTER_MS = 10 * 60_000; // auto-sleep after 10 min without touch/movement (saves credits)
 const SLEEP_WARNING_MS = 60_000;
 const NETWORK_DROP_SECONDS = 20;
+const FALL_COUNTDOWN_SECONDS = 15; // time to answer "Are you OK?" before the alert goes out
 
 const THRESHOLDS = { temp: 70, volt: 6, bat: 10, vibPeak: 15 }; // same numbers the cloud rule uses
 
@@ -57,6 +67,10 @@ export class DeviceEngine {
   private lastTouch = Date.now();
   private wakeLock: any = null;
   private listeners = new Set<(s: EngineState) => void>();
+  private fall = new FallDetector((info) => this.onFall(info));
+  private noise = new NoiseMeter();
+  private fallTimer: number | undefined;
+  private unsubMotion: (() => void) | null = null;
 
   constructor(
     readonly id: string,
@@ -76,7 +90,13 @@ export class DeviceEngine {
       chg: false,
       vib: 0,
       vibPeak: 0,
-      tilt: [0, 0],
+      orient: { frontBack: 0, leftRight: 0, heading: 0 },
+      fallCountdown: 0,
+      fallInfo: null,
+      sos: false,
+      noiseOn: false,
+      noiseLevel: null,
+      noiseError: "",
       sent: 0,
       real: false,
       rate: 1,
@@ -98,7 +118,10 @@ export class DeviceEngine {
   // ------------------------------------------------------------ lifecycle
   async start() {
     this.sensors.start();
+    this.unsubMotion = this.sensors.onMotionSample((t, x, y, z) => this.fall.feed(t, x, y, z));
     document.addEventListener("pointerdown", this.touched, { passive: true });
+    // test hook: open device.html?debug=1 and call __pulselake.testFall() from the console
+    if (new URLSearchParams(location.search).has("debug")) (window as any).__pulselake = this;
     document.addEventListener("visibilitychange", this.onVisibility);
     await this.connect();
     this.ticker = window.setInterval(this.tickUi, 250);
@@ -185,22 +208,82 @@ export class DeviceEngine {
   locate() {
     this.set({ overlay: "LOCATE" });
     navigator.vibrate?.([300, 120, 300, 120, 600]);
-    try {
-      const ctx = new AudioContext();
-      [0, 0.35, 0.7].forEach((t) => {
-        const o = ctx.createOscillator();
-        const g = ctx.createGain();
-        o.frequency.value = 1320;
-        g.gain.setValueAtTime(0.2, ctx.currentTime + t);
-        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.25);
-        o.connect(g).connect(ctx.destination);
-        o.start(ctx.currentTime + t);
-        o.stop(ctx.currentTime + t + 0.26);
-      });
-    } catch {
-      /* audio blocked - fine */
-    }
+    beep([0, 0.35, 0.7], 1320);
     setTimeout(() => this.state.overlay === "LOCATE" && this.set({ overlay: null }), 4000);
+  }
+
+  // ------------------------------------------------------------ fall detection + SOS (worker / elderly safety)
+  get fallDetection() {
+    return this.fall.enabled;
+  }
+  setFallDetection(on: boolean) {
+    this.fall.enabled = on;
+    this.set({});
+  }
+
+  /** The edge detector saw free fall -> impact -> stillness. Ask before alarming anyone. */
+  private onFall(info: FallEventInfo) {
+    if (this.state.overlay === "FALL_COUNTDOWN" || this.state.overlay === "FALL_SENT") return;
+    this.set({ overlay: "FALL_COUNTDOWN", fallInfo: info, fallCountdown: FALL_COUNTDOWN_SECONDS });
+    clearInterval(this.fallTimer);
+    const tick = () => {
+      navigator.vibrate?.(400);
+      beep([0], 880);
+      const left = this.state.fallCountdown - 1;
+      if (left <= 0) {
+        clearInterval(this.fallTimer);
+        this.publishEvent("FALL_DETECTED", this.state.fault, info);
+        this.set({ overlay: "FALL_SENT", fallCountdown: 0 });
+      } else {
+        this.set({ fallCountdown: left });
+      }
+    };
+    navigator.vibrate?.(400);
+    beep([0], 880);
+    this.fallTimer = window.setInterval(tick, 1000);
+  }
+
+  /** "I'm OK" during the countdown (false alarm) or after the alert was sent. */
+  imOk() {
+    clearInterval(this.fallTimer);
+    const info = this.state.fallInfo ?? undefined;
+    this.publishEvent(this.state.overlay === "FALL_SENT" ? "FALL_RESOLVED" : "FALL_CANCELLED", this.state.fault, info);
+    this.set({ overlay: null, fallInfo: null, fallCountdown: 0 });
+  }
+
+  /** for testing without dropping a phone: device.html?debug=1, then __pulselake.testFall() */
+  testFall() {
+    this.onFall({ impactG: 3.1, freeFallMs: 420, angleChange: 85 });
+  }
+
+  sos() {
+    this.set({ sos: true });
+    navigator.vibrate?.([200, 100, 200]);
+    this.publishEvent("SOS");
+  }
+  clearSos() {
+    this.set({ sos: false });
+    this.publishEvent("SOS_CLEARED");
+  }
+
+  // ------------------------------------------------------------ noise monitoring (audio never leaves the phone)
+  async enableNoise() {
+    try {
+      await this.noise.start(); // must run inside the tap (microphone permission)
+      this.set({ noiseOn: true, noiseError: "" });
+    } catch (e: any) {
+      this.set({ noiseOn: false, noiseError: e?.name === "NotAllowedError" ? "Microphone permission was denied" : String(e?.message ?? e) });
+    }
+  }
+  disableNoise() {
+    this.noise.stop();
+    this.set({ noiseOn: false, noiseLevel: null });
+  }
+  get noiseCalibration() {
+    return this.noise.calibration;
+  }
+  setNoiseCalibration(db: number) {
+    this.noise.setCalibration(db);
   }
 
   /** user pressed "Leave" */
@@ -213,7 +296,10 @@ export class DeviceEngine {
   private teardown(graceful: boolean) {
     clearInterval(this.loop);
     clearInterval(this.ticker);
+    clearInterval(this.fallTimer);
+    this.unsubMotion?.();
     this.sensors.stop();
+    this.noise.stop();
     document.removeEventListener("pointerdown", this.touched);
     document.removeEventListener("visibilitychange", this.onVisibility);
     this.conn?.close(graceful);
@@ -348,7 +434,9 @@ export class DeviceEngine {
       vib: w.vib,
       vibPeak: w.vibPeak,
       acc: w.acc,
-      ori: w.ori,
+      qt0: w.qt0,
+      q: w.q,
+      ...this.noise.takeSecond(),
       sensors: w.real ? "real" : "simulated",
     };
   }
@@ -360,7 +448,7 @@ export class DeviceEngine {
     return "OK";
   }
 
-  private publishEvent(type: DeviceEvent["type"], fault: Fault = this.state.fault) {
+  private publishEvent(type: DeviceEvent["type"], fault: Fault = this.state.fault, extra?: Partial<DeviceEvent>) {
     if (!this.conn) return;
     const ev: DeviceEvent = {
       v: 1,
@@ -371,17 +459,22 @@ export class DeviceEngine {
       type,
       fault,
       health: this.state.health,
+      ...extra,
     };
     this.conn.client.publish(TOPICS.events(this.id), JSON.stringify(ev), { qos: 1 });
   }
 
   // ------------------------------------------------------------ UI ticker, sleep, wake lock
   private tickUi = () => {
-    const [, beta, gamma] = this.sensors.liveOrientation;
+    const o = readout(this.sensors.liveQuat);
     const idleMs = Date.now() - Math.max(this.lastTouch, this.sensors.lastMovement);
     const left = SLEEP_AFTER_MS - idleMs;
     const sleepInSeconds = this.conn && left < SLEEP_WARNING_MS ? Math.max(0, Math.ceil(left / 1000)) : null;
-    this.set({ tilt: [round(beta, 0), round(gamma, 0)], sleepInSeconds });
+    this.set({
+      orient: { frontBack: round(o.frontBack, 0), leftRight: round(o.leftRight, 0), heading: round(o.heading, 0) },
+      noiseLevel: this.noise.level,
+      sleepInSeconds,
+    });
     if (this.conn && left <= 0) this.sleep();
   };
 
@@ -408,5 +501,24 @@ export class DeviceEngine {
     } catch {
       /* not supported / denied - fine */
     }
+  }
+}
+
+/** Short beeps through Web Audio (may be blocked until the user has tapped once). */
+function beep(at: number[], hz: number) {
+  try {
+    const ctx = new AudioContext();
+    at.forEach((t) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.frequency.value = hz;
+      g.gain.setValueAtTime(0.2, ctx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.25);
+      o.connect(g).connect(ctx.destination);
+      o.start(ctx.currentTime + t);
+      o.stop(ctx.currentTime + t + 0.26);
+    });
+  } catch {
+    /* audio blocked - fine */
   }
 }

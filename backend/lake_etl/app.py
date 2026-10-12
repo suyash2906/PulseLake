@@ -32,9 +32,9 @@ WITH (
   external_location = 's3://{BUCKET}/{SILVER_PREFIX}',
   partitioned_by = ARRAY['dt']
 ) AS
-SELECT device_id, owner, profile, event_time, event_ts_ms, ingest_latency_ms, seq, health, fault,
+SELECT device_id, owner, profile, event_time, event_ts_ms, ingest_latency_ms, seq, rate, health, fault,
        temperature_c, humidity_pct, voltage_v, battery_pct, charging, vibration_rms, vibration_peak,
-       sensor_source, dt
+       noise_dba, noise_max_dba, sensor_source, dt
 FROM (
   SELECT
     id                                   AS device_id,
@@ -44,6 +44,7 @@ FROM (
     ts                                   AS event_ts_ms,
     ingest_ts - ts                       AS ingest_latency_ms,
     seq,
+    coalesce(rate, 1)                    AS rate,
     health,
     fault,
     round(temp, 2)                       AS temperature_c,
@@ -53,6 +54,8 @@ FROM (
     chg                                  AS charging,
     vib                                  AS vibration_rms,
     vibpeak                              AS vibration_peak,
+    round(noise, 1)                      AS noise_dba,
+    round(noisemax, 1)                   AS noise_max_dba,
     sensors                              AS sensor_source,
     dt,
     row_number() OVER (PARTITION BY id, ts ORDER BY ingest_ts) AS rn
@@ -66,6 +69,33 @@ WHERE rn = 1                              -- de-duplicate (MQTT QoS0 can repeat)
 """
 
 GOLD_VIEWS = {
+    # NIOSH: 85 dB(A) for 8 h = 100 % dose; every +3 dB halves the allowed time (3-dB exchange rate)
+    "gold_noise_exposure": """
+CREATE OR REPLACE VIEW gold_noise_exposure AS
+SELECT device_id,
+       date(event_time)                                                      AS day_utc,
+       count(noise_dba)                                                      AS samples,
+       round(10 * log10(avg(power(10, noise_dba / 10))), 1)                  AS leq_dba,
+       max(noise_max_dba)                                                    AS max_dba,
+       round(sum(CASE WHEN noise_dba > 85 THEN 1.0 / rate ELSE 0 END) / 60, 1) AS minutes_above_85,
+       round(100 * sum(CASE WHEN noise_dba >= 80
+                            THEN (1.0 / rate) / (28800 / power(2, (noise_dba - 85) / 3))
+                            ELSE 0 END), 3)                                  AS niosh_dose_pct
+FROM silver_telemetry
+WHERE noise_dba IS NOT NULL
+GROUP BY device_id, date(event_time)""",
+    "gold_safety_events": """
+CREATE OR REPLACE VIEW gold_safety_events AS
+SELECT id                                                                      AS device_id,
+       max(owner)                                                              AS person,
+       sum(CASE WHEN type = 'FALL_DETECTED' THEN 1 ELSE 0 END)                 AS falls_alerted,
+       sum(CASE WHEN type = 'FALL_CANCELLED' THEN 1 ELSE 0 END)                AS false_alarms_cancelled,
+       sum(CASE WHEN type = 'SOS' THEN 1 ELSE 0 END)                           AS sos_presses,
+       round(avg(CASE WHEN type IN ('FALL_DETECTED', 'FALL_CANCELLED') THEN impactg END), 1) AS avg_impact_g,
+       max(CASE WHEN type = 'FALL_DETECTED' THEN from_unixtime(ts / 1000.0) END) AS last_fall_utc
+FROM bronze_events
+WHERE type IN ('FALL_DETECTED', 'FALL_CANCELLED', 'FALL_RESOLVED', 'SOS', 'SOS_CLEARED')
+GROUP BY id""",
     "gold_device_hourly": """
 CREATE OR REPLACE VIEW gold_device_hourly AS
 SELECT device_id,

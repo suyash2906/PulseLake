@@ -25,6 +25,9 @@
 | 4:00 | Phone 3 | Press **Crash** | "The device died without telling anyone. AWS IoT noticed the lost connection: OFFLINE in seconds." Then **Reboot**. |
 | 5:00 | Phone 4 | Turn **Wi-Fi/data off** | "A silent network loss: the dashboard shows SIGNAL LOST after 5 s, and AWS confirms OFFLINE after the MQTT keep-alive expires. The feed shows exactly how many seconds it took." Turn it back on. |
 | 6:00 | Phone 1 | Shake hard | VIBRATION warning. |
+| 6:15 | Phone 2 (Elderly care) | Hold it upright, then **drop it onto a pillow** from about 1 m | "Free fall, impact, stillness, all detected on the phone at 60 Hz." The phone asks "Are you OK?". Let the 15 s run out: FALL banner, alarm and email. Then tap "I'm OK now", and the alert is RESOLVED. Repeat once and tap "I'm OK" during the countdown: a false alarm, kept for analytics. |
+| 7:00 | Phone 3 (City noise node) | Tap **Enable noise sensor**, then play loud music or clap near it for over 10 s | "Only the number leaves the phone, never audio." The dB(A) meter rises, and a NOISE_HIGH warning follows after 10 s above 85. |
+| 7:30 | Any phone | Tilt slowly: flat, upright, on its side, upside down | The 3D twin follows with the exact angles, about 1 s behind. Compare the F/B and L/R numbers on the phone with the dashboard card. Click the phone to enlarge it. |
 | 6:30 | Presenter | Dashboard: **📍 Locate** on a card | The phone flashes and vibrates: a command sent back through the IoT Device Shadow. |
 | 7:00 | Presenter | Tab **🪣 Data lake** → **Run ETL** | "Raw JSON (Bronze) becomes clean Parquet (Silver) and Gold views. 18× smaller." Run *Fleet health report* and *Alerts per device*. Show the SQL. |
 | 8:00 | Presenter | **Time machine** → replay the rehearsal at 4× | "Because a data lake keeps raw data, we can replay history." |

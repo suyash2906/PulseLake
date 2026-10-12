@@ -1164,3 +1164,128 @@ tbody tr:hover { background: rgba(76, 201, 240, 0.05); }
 .qr svg { width: 100%; height: auto; display: block; }
 .qr-card p { color: var(--accent); margin: 0; }
 .qr-card small { color: var(--muted); }
+/* ---------------------------------------------------------------- v2: 3D twin, noise, emergencies */
+.twin { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.twin .tilt-stage { cursor: pointer; width: 100%; }
+.twin-cam {
+  transform-style: preserve-3d;
+  transform: rotateX(-22deg); /* camera slightly above: flat phones show their screen */
+}
+.twin-read {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.twin-read button {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.twin-read button:hover { color: var(--text); border-color: var(--accent); }
+.twin.big .tilt-stage { height: 440px; perspective: 1100px; cursor: default; }
+.twin.big .phone3d { --w: 140px; --h: 280px; --d: 16px; }
+.twin.big .phone3d .face { border-radius: 24px; }
+.twin.big .tilt-stage .shadow { width: 160px; height: 22px; }
+.twin.big .twin-read { font-size: 14px; }
+.twin.big .twin-read button { font-size: 13px; padding: 4px 10px; }
+.twin-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(3, 5, 10, 0.86);
+  backdrop-filter: blur(6px);
+  animation: fadeUp 0.25s ease-out;
+}
+.twin-card {
+  width: min(560px, 92vw);
+  max-height: 94vh;
+  overflow: auto;
+  background: var(--panel-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 24px;
+  padding: 22px 26px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 0 60px rgba(76, 201, 240, 0.25);
+}
+.twin-card h2 { margin: 0; font-size: 18px; text-align: center; }
+.twin-card h2 small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 4px; }
+
+.dev-charts.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dev-metrics .m.wide { grid-column: 1 / -1; }
+.noise-m .nbar {
+  position: relative;
+  height: 6px;
+  border-radius: 6px;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.07);
+}
+.noise-m .nbar i {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--ok), var(--warn) 60%, var(--fail));
+  transition: width 0.4s ease-out;
+}
+.noise-m .nbar em {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 12px;
+  background: var(--fail);
+}
+.noise-m.t-fail { border-color: var(--fail); box-shadow: 0 0 16px rgba(255, 77, 109, 0.4); }
+.noise-m.t-fail b { color: var(--fail); }
+.noise-m.t-warn b { color: var(--warn); }
+
+.dev.emergency {
+  border-color: var(--fail);
+  animation: failGlow 0.9s ease-in-out infinite;
+}
+.dev-emergency {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border-radius: 12px;
+  background: rgba(255, 77, 109, 0.18);
+  border: 1px solid var(--fail);
+  color: #ffd0d8;
+  font-size: 12px;
+}
+.dev-emergency b { font-size: 16px; color: #fff; letter-spacing: 0.06em; }
+.dev-emergency small { color: #ffb3c0; font-size: 10px; }
+
+.emergency-bar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  border-radius: var(--radius);
+  color: white;
+  font-size: 14px;
+  animation: emergencyFlash 1s ease-in-out infinite;
+}
+.emergency-bar b { font-size: 18px; letter-spacing: 0.08em; }
+.emergency-bar small { opacity: 0.85; }
+@keyframes emergencyFlash {
+  0%, 100% { background: #b5153a; box-shadow: 0 0 30px rgba(255, 77, 109, 0.6); }
+  50% { background: #ff4d6d; box-shadow: 0 0 60px rgba(255, 77, 109, 0.9); }
+}
+/* the twin column needs room for its readout + Re-center button */
+.dev-body { grid-template-columns: 150px 1fr; }
+.twin-read { flex-wrap: wrap; justify-content: center; white-space: normal; text-align: center; }
+.twin-read span { white-space: nowrap; }

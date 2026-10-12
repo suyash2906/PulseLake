@@ -112,6 +112,40 @@ We evaluated them and decided not to. Standard-IA and Intelligent-Tiering bill e
 our batch files are smaller, so tiering would cost more. Converting to compressed Parquet in Silver saves more for our
 data. Knowing when *not* to use a feature is part of cost optimisation.
 
+## Version 2: safety, noise and the 3D twin
+
+**Q: How does fall detection work, and why on the phone?**
+The phone reads its accelerometer about 60 times a second and runs the three-phase model used in fall-detection
+research: *free fall* (total acceleration near 0 g for at least 80 ms), then an *impact* (a spike of at least 2 g within
+1 s), then *stillness* for 2 s. It also measures how much the phone's orientation changed. This must run at the edge,
+because the cloud only receives one summary per second, and a free fall lasts less than half a second. The cloud does
+what a phone cannot: it raises the alert, emails a caregiver, stores the event in the data lake and reports on it.
+
+**Q: What stops false alarms?**
+Two things. First, all three phases must happen in order. Shaking, walking or putting the phone down does not do that,
+and we tested each case. Second, there is a 15-second "Are you OK?" countdown, the same idea as smartwatch fall
+detection. If the person taps "I'm OK", nothing is sent except a FALL_CANCELLED record, which we keep in the lake to
+measure the false-alarm rate (report: *falls, false alarms and SOS*).
+
+**Q: Isn't recording audio a privacy problem?**
+We never record or send audio. The phone turns the microphone signal into a single number (sound level in dB(A))
+every 100 ms, and only that number leaves the device. This is privacy by design through edge processing.
+
+**Q: How accurate are the noise numbers?**
+Approximate. Phone microphones are not calibrated instruments, which is a known limitation in noise-crowdsensing
+research. We apply the A-weighting curve in software and let the user set a calibration offset against a reference
+meter. The cloud alerts on *sustained* levels above 85 dB(A), the NIOSH occupational limit, and the Gold layer
+computes the NIOSH daily noise dose (100% = 85 dB(A) for 8 hours, with a 3 dB exchange rate).
+
+**Q: Why quaternions for the 3D twin?**
+The phone reports Euler angles (alpha, beta, gamma). Interpolating Euler angles fails near ±90° and ±180° (gimbal
+lock and wrap-around), which made version 1 jumpy and inaccurate. We convert each sample to a quaternion on the phone
+(W3C Z-X'-Y'' order), send 20 samples per second inside the normal 1-per-second message, and the dashboard
+interpolates with SLERP (spherical linear interpolation). It plays them about 1.2 s late, so it always has the next
+sample. The result is exact angles, smooth 60 fps motion and no extra messages, so no extra cost. A live mode at
+15-20 messages per second would remove the delay but cost about $0.10 per hour per phone, so we chose accuracy at
+zero extra cost.
+
 ## Cost & security
 
 **Q: How much does it cost?**

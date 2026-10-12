@@ -31,12 +31,22 @@ export interface Profile {
   baseHum: number;
 }
 
+// Use cases, not decoration: every phone runs fall detection and (if allowed) noise monitoring;
+// the profile says who / what the phone represents in the demo.
 export const PROFILES: Profile[] = [
+  { key: "worker", label: "Factory worker", icon: "🦺", baseTemp: 32, baseHum: 45 },
+  { key: "elderly", label: "Elderly care", icon: "🧓", baseTemp: 26, baseHum: 50 },
+  { key: "city", label: "City noise node", icon: "🏙️", baseTemp: 30, baseHum: 60 },
+  { key: "warehouse", label: "Warehouse", icon: "📦", baseTemp: 28, baseHum: 55 },
+];
+// older sessions in the data lake still carry the first-version profile keys
+export const LEGACY_PROFILES: Profile[] = [
   { key: "motor", label: "Industrial Motor", icon: "⚙️", baseTemp: 48, baseHum: 40 },
   { key: "cold", label: "Cold Storage", icon: "❄️", baseTemp: 4, baseHum: 70 },
   { key: "truck", label: "Delivery Truck", icon: "🚚", baseTemp: 31, baseHum: 55 },
   { key: "wearable", label: "Health Wearable", icon: "❤️", baseTemp: 36.6, baseHum: 50 },
 ];
+export const profileOf = (key?: string) => [...PROFILES, ...LEGACY_PROFILES].find((p) => p.key === key);
 
 export const FAULTS: { key: Exclude<Fault, "NONE">; label: string; icon: string; severity: Health; hint: string }[] = [
   { key: "OVERHEAT", label: "Overheat", icon: "🔥", severity: "FAILED", hint: "Temperature runs away" },
@@ -66,7 +76,11 @@ export interface Telemetry {
   vib: number; // m/s² RMS of dynamic acceleration (REAL accelerometer)
   vibPeak: number; // m/s² peak in this window
   acc: [number, number, number]; // latest acceleration incl. gravity
-  ori: [number, number, number][]; // ~10 orientation samples [alpha, beta, gamma] for smooth 3D
+  qt0?: number; // device epoch ms of the first orientation sample in `q`
+  q?: number[][]; // ~20 orientation samples per second: [dtMs from qt0, w, x, y, z] (quaternion)
+  ori?: [number, number, number][]; // v1 messages: Euler samples [alpha, beta, gamma] at 10 Hz
+  noise?: number | null; // approx. dB(A), 1 s equivalent level (Leq); null = microphone off
+  noiseMax?: number | null; // loudest 100 ms in that second
   sensors: "real" | "simulated";
 }
 
@@ -77,9 +91,21 @@ export interface DeviceEvent {
   owner: string;
   profile: string;
   ts: number;
-  type: "ONLINE" | "FAULT_INJECTED" | "FAULT_CLEARED" | "GOODBYE";
+  type:
+    | "ONLINE"
+    | "FAULT_INJECTED"
+    | "FAULT_CLEARED"
+    | "GOODBYE"
+    | "FALL_DETECTED" // no answer to "Are you OK?" within 15 s
+    | "FALL_CANCELLED" // person tapped "I'm OK" during the countdown (false alarm)
+    | "FALL_RESOLVED" // person confirmed OK after the alert was sent
+    | "SOS"
+    | "SOS_CLEARED";
   fault: Fault;
   health: Health;
+  impactG?: number; // fall: peak acceleration at impact, in g
+  freeFallMs?: number; // fall: duration of the free-fall phase
+  angleChange?: number; // fall: degrees between orientation before and after
 }
 
 /** Published by the Alert Lambda on pulselake/alerts */
@@ -92,7 +118,7 @@ export interface Alert {
   severity: "INFO" | "WARNING" | "CRITICAL";
   status: "ACTIVE" | "RESOLVED";
   message: string;
-  source: "DEVICE_FAULT" | "CLOUD_RULE" | "PRESENCE";
+  source: "DEVICE_FAULT" | "CLOUD_RULE" | "PRESENCE" | "EDGE";
   etaSec?: number; // PREDICTED_OVERHEAT: seconds until the limit, at alert time
   predictedLeadSec?: number; // OVERHEAT: how long before it the cloud predicted it
   resolvedAt?: number;

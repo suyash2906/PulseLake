@@ -103,6 +103,29 @@ WHERE type IN ('FAULT_INJECTED', 'FAULT_CLEARED') AND {SINCE}
 ORDER BY ts DESC
 LIMIT 50""",
     },
+    "noise_per_minute": {
+        "title": "Noise level per minute (last 2 h)",
+        "layer": "bronze",
+        "sql": f"""
+SELECT date_format(from_unixtime(ts / 1000), '%H:%i') AS minute_utc, id AS device, max(owner) AS owner,
+       round(10 * log10(avg(power(10, noise / 10))), 1) AS leq_dba, max(noisemax) AS max_dba
+FROM bronze_telemetry
+WHERE {SINCE} AND {PHONES} AND noise IS NOT NULL
+  AND ts > to_unixtime(current_timestamp - interval '2' hour) * 1000
+GROUP BY 1, 2
+ORDER BY 1 DESC, 2
+LIMIT 120""",
+    },
+    "gold_noise_exposure": {
+        "title": "Gold · daily noise exposure (NIOSH dose)",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_noise_exposure ORDER BY day_utc DESC, device_id",
+    },
+    "gold_safety_events": {
+        "title": "Gold · falls, false alarms and SOS",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_safety_events ORDER BY falls_alerted DESC, device_id",
+    },
     "gold_fleet_health": {
         "title": "Gold · fleet health report",
         "layer": "gold",
@@ -291,7 +314,8 @@ def replay(start, end):
     window = f"dt BETWEEN '{d1}' AND '{d2}' AND ts BETWEEN {start} AND {end}"
     started = time.time()
     cols, rows = athena_rows(f"""
-SELECT id, owner, profile, seq, ts, rate, health, fault, temp, hum, volt, bat, chg, vib, vibpeak, acc, ori, sensors
+SELECT id, owner, profile, seq, ts, rate, health, fault, temp, hum, volt, bat, chg, vib, vibpeak, acc, ori,
+       qt0, q, noise, noisemax, sensors
 FROM bronze_telemetry WHERE {window} AND {PHONES} ORDER BY ts LIMIT 20000""")
     keep_ori = len(rows) <= 8000  # keep the response well under Lambda's 6 MB limit
     telemetry = []
@@ -304,12 +328,15 @@ FROM bronze_telemetry WHERE {window} AND {PHONES} ORDER BY ts LIMIT 20000""")
             "volt": _num(rec["volt"]), "bat": _num(rec["bat"], int), "chg": rec["chg"] == "true",
             "vib": _num(rec["vib"]), "vibPeak": _num(rec["vibpeak"]), "acc": _arr(rec["acc"]),
             "ori": _arr(rec["ori"]) if keep_ori else [], "sensors": rec["sensors"],
+            "qt0": _num(rec["qt0"], int), "q": _arr(rec["q"]) if keep_ori else [],
+            "noise": _num(rec["noise"]), "noiseMax": _num(rec["noisemax"]),
         })
     _, ev_rows = athena_rows(f"""
-SELECT id, owner, profile, ts, type, fault, health FROM bronze_events
+SELECT id, owner, profile, ts, type, fault, health, impactg, freefallms, anglechange FROM bronze_events
 WHERE dt BETWEEN '{d1}' AND '{d2}' AND ts BETWEEN {start} AND {end} ORDER BY ts""")
-    events = [{"v": 1, "id": a, "owner": b, "profile": c, "ts": _num(d, int), "type": e, "fault": f, "health": g}
-              for a, b, c, d, e, f, g in ev_rows]
+    events = [{"v": 1, "id": a, "owner": b, "profile": c, "ts": _num(d, int), "type": e, "fault": f, "health": g,
+               "impactG": _num(h), "freeFallMs": _num(i), "angleChange": _num(j)}
+              for a, b, c, d, e, f, g, h, i, j in ev_rows]
     # a RESOLVED record keeps the original ts; replay it at the moment it was resolved
     _, al_rows = athena_rows(f"""
 SELECT alertid, deviceid, owner, ts, type, severity, status, message, source,

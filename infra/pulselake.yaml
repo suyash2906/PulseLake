@@ -403,7 +403,7 @@ Resources:
         Description: Abnormal telemetry (or heartbeat sample) -> alert processor
         Sql: >-
           SELECT *, 'telemetry' AS kind FROM 'pulselake/devices/+/telemetry'
-          WHERE fault <> 'NONE' OR health <> 'OK' OR temp > 55 OR volt > 6 OR bat < 10
+          WHERE fault <> 'NONE' OR health <> 'OK' OR temp > 55 OR volt > 6 OR bat < 10 OR noise > 85
           OR vibPeak > 15 OR seq % 5 = 0
         RuleDisabled: false
         Actions:
@@ -619,6 +619,10 @@ Resources:
             - { Name: vibpeak, Type: double }
             - { Name: acc, Type: "array<double>" }
             - { Name: ori, Type: "array<array<double>>" }
+            - { Name: qt0, Type: bigint }
+            - { Name: q, Type: "array<array<double>>" }
+            - { Name: noise, Type: double }
+            - { Name: noisemax, Type: double }
             - { Name: sensors, Type: string }
             - { Name: thing, Type: string }
             - { Name: ingest_ts, Type: bigint }
@@ -658,6 +662,9 @@ Resources:
             - { Name: type, Type: string }
             - { Name: fault, Type: string }
             - { Name: health, Type: string }
+            - { Name: impactg, Type: double }
+            - { Name: freefallms, Type: double }
+            - { Name: anglechange, Type: double }
             - { Name: ingest_ts, Type: bigint }
 
   BronzeAlertsTable:

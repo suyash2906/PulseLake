@@ -1,11 +1,17 @@
 // Fleet state for the dashboard, fed by live MQTT messages (or by the time-machine replay).
 // Plain class + useSyncExternalStore; UI notifications are throttled to ~5/s.
 import { useSyncExternalStore } from "react";
+import { fromW3C, type Quat } from "../shared/quat";
 import { SLOTS, type Alert, type DeviceEvent, type Health, type PresenceEvent, type Telemetry } from "../shared/types";
 
 export const SIGNAL_LOST_MS = 5000;
 const HISTORY = 120; // points kept per device for sparklines/charts
 const RATE_HISTORY = 120; // seconds of msgs/sec history
+/**
+ * Orientation samples arrive in 1-second batches; each is played back this long after it was
+ * measured (corrected for clock offset), so the twin always has the next sample to move toward.
+ */
+export const PLAYBACK_DELAY_MS = 1200;
 
 export type DeviceStatus = "WAITING" | "OK" | "WARNING" | "FAILED" | "SIGNAL_LOST" | "OFFLINE" | "LEFT";
 export type Mode = "live" | "replay";
@@ -22,8 +28,9 @@ export interface DeviceView {
   presenceReason?: string;
   presenceAt?: number;
   left?: boolean; // said GOODBYE (left / sleeping)
-  hist: { t: number; temp: number; vib: number; hum: number; bat: number; volt: number }[];
-  ori: [number, number, number][]; // queue of orientation samples to replay
+  hist: { t: number; temp: number; vib: number; hum: number; bat: number; volt: number; noise: number | null }[];
+  pose: { t: number; q: Quat }[]; // orientation samples on the local clock, ready for playback
+  offs: number[]; // recent (receive time - device time) values; their minimum = clock offset
 }
 
 /** virtual (load-test) devices are aggregated, not shown as cards */
@@ -57,7 +64,7 @@ export interface FleetSnapshot {
 let feedSeq = 0;
 const isSim = (id: string) => id.startsWith("SIM_");
 const emptyDevices = () =>
-  Object.fromEntries(SLOTS.map((id) => [id, { id, presence: "unknown", hist: [], ori: [] } as DeviceView]));
+  Object.fromEntries(SLOTS.map((id) => [id, { id, presence: "unknown", hist: [], pose: [], offs: [] } as DeviceView]));
 
 class FleetStore {
   mode: Mode = "live";
@@ -115,7 +122,7 @@ class FleetStore {
   }
 
   private dev(id: string): DeviceView {
-    return (this.devices[id] ??= { id, presence: "unknown", hist: [], ori: [] });
+    return (this.devices[id] ??= { id, presence: "unknown", hist: [], pose: [], offs: [] });
   }
 
   telemetry(m: Telemetry) {
@@ -140,11 +147,31 @@ class FleetStore {
     d.profile = m.profile;
     d.left = false;
     if (d.presence !== "online") d.presence = "online"; // data proves it is connected
-    d.hist.push({ t: now, temp: m.temp, vib: m.vibPeak, hum: m.hum, bat: m.bat, volt: m.volt });
+    d.hist.push({ t: now, temp: m.temp, vib: m.vibPeak, hum: m.hum, bat: m.bat, volt: m.volt, noise: m.noise ?? null });
     if (d.hist.length > HISTORY) d.hist.splice(0, d.hist.length - HISTORY);
-    d.ori.push(...(m.ori ?? []));
-    if (d.ori.length > 60) d.ori.splice(0, d.ori.length - 60);
+    this.queuePose(d, m, now);
     if (wasSilent && d.hist.length > 1) this.push({ deviceId: m.id, tone: "ok", icon: "📶", text: `${m.id} signal restored` });
+  }
+
+  /** Put this message's orientation samples on the local clock for smooth, exact playback. */
+  private queuePose(d: DeviceView, m: Telemetry, now: number) {
+    const add = (t: number, q: Quat) => {
+      const last = d.pose[d.pose.length - 1];
+      if (!last || t > last.t) d.pose.push({ t, q });
+    };
+    if (m.q?.length && m.qt0) {
+      // receive time minus device time of the newest sample = network delay + clock difference;
+      // the smallest value seen recently is the best estimate of the pure clock difference
+      d.offs.push(now - (m.qt0 + m.q[m.q.length - 1][0]));
+      if (d.offs.length > 30) d.offs.shift();
+      const offset = Math.min(...d.offs);
+      for (const s of m.q) add(m.qt0 + s[0] + offset + PLAYBACK_DELAY_MS, [s[1], s[2], s[3], s[4]]);
+    } else if (m.ori?.length) {
+      // first-version messages (Euler angles at 10 Hz, no timestamps)
+      m.ori.forEach((o, i) => add(now - (m.ori!.length - 1 - i) * 100 + PLAYBACK_DELAY_MS, fromW3C(o[0], o[1], o[2])));
+    }
+    // a fast replay can outrun real time: keep at most ~4 s queued
+    if (d.pose.length > 80) d.pose.splice(0, d.pose.length - 80);
   }
 
   event(e: DeviceEvent) {
@@ -161,6 +188,16 @@ class FleetStore {
       this.push({ deviceId: e.id, tone: "warn", icon: "🧪", text: `${e.owner} injected ${e.fault} on ${e.id}` });
     } else if (e.type === "FAULT_CLEARED") {
       this.push({ deviceId: e.id, tone: "ok", icon: "🛠️", text: `${e.owner} cleared ${e.fault} on ${e.id}` });
+    } else if (e.type === "FALL_DETECTED") {
+      this.push({ deviceId: e.id, tone: "fail", icon: "🚨", text: `FALL: ${e.owner} (${e.id}) did not answer "Are you OK?" - impact ${e.impactG ?? "?"} g` });
+    } else if (e.type === "FALL_CANCELLED") {
+      this.push({ deviceId: e.id, tone: "warn", icon: "🙋", text: `${e.owner} (${e.id}) fall detected but cancelled: "I'm OK" (false alarm)` });
+    } else if (e.type === "FALL_RESOLVED") {
+      this.push({ deviceId: e.id, tone: "ok", icon: "💚", text: `${e.owner} (${e.id}) confirmed OK after the fall` });
+    } else if (e.type === "SOS") {
+      this.push({ deviceId: e.id, tone: "fail", icon: "🆘", text: `SOS pressed by ${e.owner} (${e.id})` });
+    } else if (e.type === "SOS_CLEARED") {
+      this.push({ deviceId: e.id, tone: "ok", icon: "✋", text: `${e.owner} (${e.id}) cancelled the SOS` });
     }
     this.emit("event", e.id);
     this.dirty = true;
@@ -231,7 +268,7 @@ class FleetStore {
     const now = Date.now();
     this.recent = (this.recent ?? []).filter((t) => now - t < 5000);
     const devices: Record<string, DeviceView> = {};
-    for (const [k, v] of Object.entries(this.devices ?? {})) devices[k] = { ...v, hist: v.hist, ori: v.ori };
+    for (const [k, v] of Object.entries(this.devices ?? {})) devices[k] = { ...v, hist: v.hist, pose: v.pose };
     return {
       mode: this.mode ?? "live",
       devices,

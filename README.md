@@ -50,6 +50,16 @@ Raw IoT data is stored unchanged (Bronze), processed copies in an analytics form
 curated aggregates (Gold, Athena views). Data is partitioned by date/hour, described in a central catalog
 (Glue) and queried **schema-on-read** with Athena — storage and compute are separated.
 
+### Use cases (version 2)
+- **Fall detection (worker and elderly safety):** a free-fall, impact and stillness model runs on the phone at 60 Hz,
+  followed by a 15 s "Are you OK?" countdown. The cloud raises a CRITICAL FALL alert, sends email and stores it in
+  the lake. An SOS button is also included.
+- **Noise monitoring (smart city / factory):** an A-weighted sound level is computed on the phone, and only the
+  number is sent. The cloud alerts on sustained levels above 85 dB(A), and the Gold layer computes the NIOSH daily
+  noise dose.
+- **Accurate 3D twin:** 20 quaternion samples per second, played with SLERP interpolation about 1.2 s behind the
+  phone. Exact angles, Re-center, live angle readout, click to enlarge.
+
 ### Extra capabilities
 - **Predictive early warning:** the Alert Lambda fits a trend line on the last 25 s of temperatures and raises
   `PREDICTED_OVERHEAT` before the limit is crossed (measured: 16-17 s in advance).

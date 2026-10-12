@@ -21,7 +21,7 @@ ssm = boto3.client("ssm")
 STATUS_PARAM = os.environ["SIM_STATUS_PARAM"]
 MAX_DEVICES = 200
 MAX_SECONDS = 120
-PROFILES = [("motor", 48), ("cold", 4), ("truck", 31), ("wearable", 36.6)]
+PROFILES = [("worker", 32), ("elderly", 26), ("city", 30), ("warehouse", 28)]
 
 _iot_data = None
 
@@ -74,7 +74,7 @@ class VirtualDevice:
             "volt": round(5 + random.uniform(-0.03, 0.03), 2), "bat": round(bat), "chg": False,
             "vib": round(vib, 2), "vibPeak": round(vib * 1.6, 2),
             "acc": [round(random.uniform(-0.05, 0.05), 2), round(random.uniform(-0.05, 0.05), 2), 9.81],
-            "ori": [], "sensors": "simulated",
+            "ori": [], "noise": round(55 + 10 * abs(math.sin(t / 9 + self.phase)) + random.uniform(-2, 2), 1), "sensors": "simulated",
         }
 
 

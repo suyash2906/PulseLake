@@ -28,7 +28,7 @@ foreach ($prefix in "bronze/", "silver/", "athena-results/", "errors/") {
 }
 
 Write-Step "Dropping Silver table and Gold views (the ETL rebuilds them)"
-foreach ($t in "silver_telemetry", "gold_device_hourly", "gold_fleet_health", "gold_alert_summary") {
+foreach ($t in "silver_telemetry", "gold_device_hourly", "gold_fleet_health", "gold_alert_summary", "gold_noise_exposure", "gold_safety_events") {
     & $AwsExe glue delete-table --database-name $db --name $t --region $Region 2>$null
 }
 

@@ -3,6 +3,7 @@ import { Brand } from "../shared/Logo";
 import { connectIot, type IotConnection } from "../shared/awsIot";
 import { FAULTS, PROFILES, SLOTS, TOPICS, type Health, type Profile, type Telemetry } from "../shared/types";
 import { DeviceEngine, type EngineState } from "./engine";
+import { noiseBand } from "./noise";
 import { requestMotionPermission } from "./sensors";
 
 const NAME_KEY = "pulselake.owner";
@@ -22,7 +23,7 @@ export function DeviceApp() {
 function SetupScreen({ onJoin }: { onJoin: (e: DeviceEngine) => void }) {
   const [slot, setSlot] = useState<string>(() => read(SLOT_KEY) ?? "");
   const [owner, setOwner] = useState<string>(() => read(NAME_KEY) ?? "");
-  const [profileKey, setProfileKey] = useState<string>(() => read(PROFILE_KEY) ?? PROFILES[0].key);
+  const [profileKey, setProfileKey] = useState<string>(() => PROFILES.find((p) => p.key === read(PROFILE_KEY))?.key ?? PROFILES[0].key);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const occupancy = useSlotOccupancy();
@@ -34,7 +35,7 @@ function SetupScreen({ onJoin }: { onJoin: (e: DeviceEngine) => void }) {
     write(NAME_KEY, owner.trim());
     write(PROFILE_KEY, profileKey);
     await requestMotionPermission(); // must run inside the tap (iPhone)
-    const profile = PROFILES.find((p) => p.key === profileKey)!;
+    const profile = PROFILES.find((p) => p.key === profileKey) ?? PROFILES[0];
     const engine = new DeviceEngine(slot, owner.trim(), profile);
     try {
       await engine.start();
@@ -193,8 +194,32 @@ function LiveScreen({ engine, onLeave }: { engine: DeviceEngine; onLeave: () => 
         <Metric icon="📳" label="Vibration" value={`${s.vibPeak.toFixed(1)}`} unit="m/s²" bar={Math.min(1, s.vibPeak / 20)} alert={s.vibPeak > 15} />
         <Metric icon={s.chg ? "🔌" : "🔋"} label="Battery" value={`${s.bat}%`} alert={s.bat < 10} />
         <Metric icon="⚡" label="Voltage" value={`${s.volt.toFixed(2)} V`} alert={s.volt > 6} />
-        <Metric icon="📐" label="Tilt" value={`${s.tilt[0]}° / ${s.tilt[1]}°`} />
+        <Metric icon="🔊" label="Noise" value={s.noiseLevel === null ? "off" : `${s.noiseLevel.toFixed(0)}`} unit={s.noiseLevel === null ? undefined : "dB(A)"} bar={s.noiseLevel === null ? undefined : Math.min(1, Math.max(0, (s.noiseLevel - 30) / 70))} alert={(s.noiseLevel ?? 0) > 85} />
       </div>
+
+      <div className="dv-orient mono" title="Compare with the 3D twin on the dashboard (about 1 s behind)">
+        <span>📐 front/back <b>{s.orient.frontBack}°</b></span>
+        <span>left/right <b>{s.orient.leftRight}°</b></span>
+        <span>heading <b>{s.orient.heading}°</b></span>
+      </div>
+
+      <section className="dv-card dv-safety">
+        <h3>Safety <small>detected on this phone (edge)</small></h3>
+        <div className="dv-row">
+          <div>
+            <b>Fall detection {engine.fallDetection ? "ON" : "OFF"}</b>
+            <small>free fall → impact → stillness, then "Are you OK?"</small>
+          </div>
+          <button className={`dv-toggle ${engine.fallDetection ? "on" : ""}`} onClick={() => engine.setFallDetection(!engine.fallDetection)}>
+            {engine.fallDetection ? "Turn off" : "Turn on"}
+          </button>
+        </div>
+        <button className={`dv-sos ${s.sos ? "on" : ""}`} disabled={s.conn !== "online"} onClick={() => (s.sos ? engine.clearSos() : engine.sos())}>
+          {s.sos ? "✋ Cancel SOS" : "🆘 SOS - call for help"}
+        </button>
+      </section>
+
+      <NoiseCard engine={engine} on={s.noiseOn} level={s.noiseLevel} error={s.noiseError} />
 
       <section className="dv-card">
         <h3>Environment <small>simulated sensors</small></h3>
@@ -247,6 +272,22 @@ function LiveScreen({ engine, onLeave }: { engine: DeviceEngine; onLeave: () => 
           <button className="dv-cta" onClick={() => engine.wake()}>Wake up</button>
         </Overlay>
       )}
+      {s.overlay === "FALL_COUNTDOWN" && (
+        <div className="dv-fall">
+          <div className="ico">🆘</div>
+          <h2>Fall detected. Are you OK?</h2>
+          <p>An alert goes to Mission Control in</p>
+          <div className="dv-count mono">{s.fallCountdown}s</div>
+          <button className="dv-ok" onClick={() => engine.imOk()}>I'm OK</button>
+          {s.fallInfo && <small className="mono">impact {s.fallInfo.impactG} g · free fall {s.fallInfo.freeFallMs} ms · turned {s.fallInfo.angleChange}°</small>}
+        </div>
+      )}
+      {s.overlay === "FALL_SENT" && (
+        <Overlay tone="fail" icon="🚑" title="Alert sent">
+          <p>Mission Control has been alerted that {engine.owner} may have fallen. Help is on the way.</p>
+          <button className="dv-cta" onClick={() => engine.imOk()}>I'm OK now</button>
+        </Overlay>
+      )}
       {s.overlay === "LOCATE" && (
         <div className="dv-locate">
           <div className="ico">📍</div>
@@ -261,6 +302,44 @@ function LiveScreen({ engine, onLeave }: { engine: DeviceEngine; onLeave: () => 
         </Overlay>
       )}
     </div>
+  );
+}
+
+/** Microphone on/off, live level and calibration. Only numbers leave the phone. */
+function NoiseCard({ engine, on, level, error }: { engine: DeviceEngine; on: boolean; level: number | null; error: string }) {
+  const [cal, setCal] = useState(engine.noiseCalibration);
+  const band = noiseBand(level);
+  return (
+    <section className="dv-card">
+      <h3>Noise monitoring <small>audio never leaves this phone</small></h3>
+      {!on ? (
+        <>
+          <p className="dv-tip">Measures how loud it is around this phone (approx. dB(A)), like a sound-level meter. Only the number is sent to the cloud.</p>
+          <button className="dv-recover" onClick={() => engine.enableNoise()}>🎙️ Enable noise sensor</button>
+        </>
+      ) : (
+        <>
+          <div className={`dv-noise tone-${band.tone}`}>
+            <b className="mono">{level === null ? "…" : level.toFixed(0)}</b>
+            <span>dB(A) · {band.label}</span>
+          </div>
+          <Slider
+            label="Calibration offset"
+            unit=" dB"
+            min={60}
+            max={140}
+            value={cal}
+            onChange={(v) => {
+              setCal(v);
+              engine.setNoiseCalibration(v);
+            }}
+          />
+          <p className="dv-tip">Phone microphones are not calibrated: adjust the offset until a quiet room reads about 35 dB, or match a sound-meter app. Above 85 dB(A) the cloud raises a NOISE alert.</p>
+          <button className="dv-leave" onClick={() => engine.disableNoise()}>Turn off microphone</button>
+        </>
+      )}
+      {error && <div className="dv-error">{error}</div>}
+    </section>
   );
 }
 

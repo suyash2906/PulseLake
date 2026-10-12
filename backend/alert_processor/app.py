@@ -27,6 +27,8 @@ ALERT_MQTT_TOPIC = "pulselake/alerts"
 ALERT_TTL_DAYS = 7
 EMAIL_COOLDOWN_MS = 120_000
 GOODBYE_WINDOW_MS = 15_000  # a disconnect within 15 s after GOODBYE is a planned leave
+NOISE_LIMIT_DBA = 85  # NIOSH recommended exposure limit (8-h average); here: sustained level
+NOISE_SUSTAIN_MS = 10_000
 
 sns = boto3.client("sns")
 _iot_data = None
@@ -121,22 +123,27 @@ def publish_alert(alert):
         print(f"republish failed: {e}")
 
 
+URGENT_TYPES = ("FALL", "SOS")  # a person may be hurt: always email, no cooldown
+
+
 def maybe_email(device, alert):
     if not SNS_TOPIC or alert["severity"] != "CRITICAL" or alert["status"] != "ACTIVE":
         return
     if alert["deviceId"].startswith("SIM_"):
         return  # virtual fleet (load test) never emails
-    if now_ms() - int(device.get("lastEmailAt", 0)) < EMAIL_COOLDOWN_MS:
+    urgent = alert["type"] in URGENT_TYPES
+    if not urgent and now_ms() - int(device.get("lastEmailAt", 0)) < EMAIL_COOLDOWN_MS:
         return
-    try:
-        DEVICES.update_item(
-            Key={"deviceId": alert["deviceId"]},
-            UpdateExpression="SET lastEmailAt = :n",
-            ConditionExpression="attribute_not_exists(lastEmailAt) OR lastEmailAt < :cut",
-            ExpressionAttributeValues={":n": now_ms(), ":cut": now_ms() - EMAIL_COOLDOWN_MS},
-        )
-    except ClientError:
-        return  # another invocation just emailed
+    if not urgent:
+        try:
+            DEVICES.update_item(
+                Key={"deviceId": alert["deviceId"]},
+                UpdateExpression="SET lastEmailAt = :n",
+                ConditionExpression="attribute_not_exists(lastEmailAt) OR lastEmailAt < :cut",
+                ExpressionAttributeValues={":n": now_ms(), ":cut": now_ms() - EMAIL_COOLDOWN_MS},
+            )
+        except ClientError:
+            return  # another invocation just emailed
     when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(alert["ts"] / 1000))
     sns.publish(
         TopicArn=SNS_TOPIC,
@@ -247,6 +254,16 @@ def handle_telemetry(m):
     if frozen_count >= 2:
         hits["SENSOR_FROZEN"] = ("WARNING", "Last 3 readings are identical - sensor appears frozen")
 
+    # Noise exposure: only a SUSTAINED level counts (a single clap is not a hazard).
+    noise = m.get("noise")
+    loud_since = device.get("loudSince")
+    if isinstance(noise, (int, float)) and noise > NOISE_LIMIT_DBA:
+        loud_since = loud_since or int(_num(m, "ts"))
+        if int(_num(m, "ts")) - int(loud_since) >= NOISE_SUSTAIN_MS:
+            hits["NOISE_HIGH"] = ("WARNING", f"Noise {noise:.0f} dB(A) above the {NOISE_LIMIT_DBA} dB(A) exposure limit for over {NOISE_SUSTAIN_MS // 1000} s")
+    else:
+        loud_since = 0
+
     # Predictive analytics: fit a trend on recent temperatures and warn BEFORE the limit.
     msg_ts = int(_num(m, "ts"))
     hist = [p for p in (device.get("tempHist") or []) if msg_ts - p[0] <= HIST_WINDOW_MS and p[0] < msg_ts]
@@ -272,11 +289,12 @@ def handle_telemetry(m):
         DEVICES.update_item(
             Key={"deviceId": device_id},
             UpdateExpression="SET fingerprint = :fp, frozenCount = :fc, lastSeq = :sq, lastTs = :mts, lastSeen = :ts, "
-                             "tempHist = :th, #o = :o, #p = :p, health = :h, #on = :on",
+                             "tempHist = :th, loudSince = :ls, #o = :o, #p = :p, health = :h, #on = :on",
             ConditionExpression="attribute_not_exists(lastTs) OR lastTs < :mts",
             ExpressionAttributeNames={"#o": "owner", "#p": "profile", "#on": "online"},  # DynamoDB reserved words
             ExpressionAttributeValues={":fp": fp, ":fc": frozen_count, ":sq": seq, ":mts": msg_ts, ":ts": ts,
-                                       ":th": to_ddb(hist), ":o": m.get("owner", ""), ":p": m.get("profile", ""),
+                                       ":th": to_ddb(hist), ":ls": int(loud_since or 0),
+                                       ":o": m.get("owner", ""), ":p": m.get("profile", ""),
                                        ":h": m.get("health", "OK"), ":on": True},
         )
     except ClientError as e:
@@ -303,6 +321,7 @@ def handle_telemetry(m):
 
     holds = {c[0]: c[4] for c in CONDITIONS}
     holds["PREDICTED_OVERHEAT"] = PREDICT_HOLD_MS
+    holds["NOISE_HIGH"] = 5000
     for a_type, info in active.items():
         if info.get("source") != "CLOUD_RULE" or a_type in hits:
             continue
@@ -350,10 +369,34 @@ def handle_presence(p):
     open_alert(device, "OFFLINE", "CRITICAL", f"Device went offline unexpectedly: {detail} ({reason}).", "PRESENCE", ts)
 
 
+def handle_safety_event(e):
+    """Falls and SOS are detected ON THE PHONE (edge); the cloud alerts, emails and records them."""
+    device = get_device(e["id"])
+    device["owner"] = e.get("owner", device.get("owner", ""))
+    active = device.get("active", {}) or {}
+    owner = device["owner"] or e["id"]
+    kind = e.get("type")
+    ts = int(_num(e, "ts", now_ms()))
+    if kind == "FALL_DETECTED":
+        open_alert(device, "FALL", "CRITICAL",
+                   f"Fall detected for {owner}: impact {_num(e, 'impactG'):.1f} g, free fall {_num(e, 'freeFallMs'):.0f} ms, "
+                   f"turned {_num(e, 'angleChange'):.0f} deg, no answer to 'Are you OK?' for 15 s",
+                   "EDGE", ts, {"impactG": _num(e, "impactG"), "freeFallMs": _num(e, "freeFallMs")})
+    elif kind == "FALL_RESOLVED" and "FALL" in active:
+        resolve_alert(device, "FALL", active["FALL"], f"{owner} confirmed they are OK")
+    elif kind == "SOS":
+        open_alert(device, "SOS", "CRITICAL", f"{owner} pressed the SOS button and needs help", "EDGE", ts)
+    elif kind == "SOS_CLEARED" and "SOS" in active:
+        resolve_alert(device, "SOS", active["SOS"], f"{owner} cancelled the SOS")
+    # FALL_CANCELLED = false alarm the person dismissed: no alert, but it is kept in the lake
+
+
 def handle_event(e):
     device_id = e.get("id")
     if not device_id:
         return
+    if e.get("type") in ("FALL_DETECTED", "FALL_RESOLVED", "SOS", "SOS_CLEARED"):
+        handle_safety_event(e)
     values = {":o": e.get("owner", ""), ":p": e.get("profile", ""), ":ts": now_ms()}
     expr = "SET #o = :o, #p = :p, lastEventAt = :ts"
     if e.get("type") == "GOODBYE":

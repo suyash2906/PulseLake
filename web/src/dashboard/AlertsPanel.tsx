@@ -7,6 +7,7 @@ const SOURCE_LABEL: Record<string, string> = {
   CLOUD_RULE: "cloud rule",
   PRESENCE: "AWS presence",
   DEVICE_FAULT: "device",
+  EDGE: "the phone (edge)",
 };
 
 export function AlertsPanel({ alerts, sound, now }: { alerts: Alert[]; sound: boolean; now: number }) {

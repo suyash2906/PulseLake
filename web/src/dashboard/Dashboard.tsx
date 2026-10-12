@@ -75,6 +75,19 @@ export function Dashboard() {
 
       <ReplayBar />
 
+      {phoneAlerts
+        .filter((a) => (a.type === "FALL" || a.type === "SOS") && a.status === "ACTIVE")
+        .map((a) => (
+          <div key={a.alertId} className="emergency-bar">
+            <b>{a.type === "FALL" ? "🚨 FALL DETECTED" : "🆘 SOS"}</b>
+            <span>
+              {a.deviceId.replace("_", " ")} · {a.owner}
+            </span>
+            <small>{a.message}</small>
+            <small className="mono">{new Date(a.ts).toLocaleTimeString()}</small>
+          </div>
+        ))}
+
       <nav className="tabs">
         {TABS.map((t) => (
           <button key={t.key} className={tab === t.key ? "on" : ""} onClick={() => pickTab(t.key)}>
