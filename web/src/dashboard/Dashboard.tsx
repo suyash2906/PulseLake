@@ -2,23 +2,34 @@ import { useEffect, useState } from "react";
 import { Brand } from "../shared/Logo";
 import { loadConfig } from "../shared/awsIot";
 import { SLOTS } from "../shared/types";
+import { AccuracyLab } from "./AccuracyLab";
 import { AlertsPanel, unlockAudio } from "./AlertsPanel";
 import { CostMeter } from "./CostMeter";
 import { DeviceCard } from "./DeviceCard";
+import { FleetMap } from "./FleetMap";
 import { JoinQR } from "./JoinQR";
 import { LakePanel } from "./LakePanel";
 import { useLiveFeed } from "./live";
 import { Pipeline } from "./Pipeline";
+import { RulesPanel } from "./RulesPanel";
 import { ReplayBar, TimeMachine } from "./TimeMachine";
 import { VirtualFleet } from "./VirtualFleet";
 import { statusOf, useFleet, type FeedItem } from "./store";
 
-type Tab = "live" | "lake" | "scale";
+type Tab = "live" | "rules" | "lake" | "lab" | "scale";
 const TABS: { key: Tab; label: string }[] = [
   { key: "live", label: "📡 Live fleet" },
+  { key: "rules", label: "⚡ Rules & Actions" },
   { key: "lake", label: "🪣 Data lake" },
+  { key: "lab", label: "🎯 Accuracy Lab" },
   { key: "scale", label: "🚀 Scale test" },
 ];
+const ESCALATION_TEXT: Record<string, string> = {
+  LEVEL1: "⏳ notifying first contact",
+  LEVEL2: "⏰ escalated to everyone",
+  UNANSWERED: "‼️ NOBODY HAS RESPONDED",
+  ACKED: "✅ being handled",
+};
 
 export function Dashboard() {
   const conn = useLiveFeed();
@@ -78,12 +89,18 @@ export function Dashboard() {
       {phoneAlerts
         .filter((a) => (a.type === "FALL" || a.type === "SOS") && a.status === "ACTIVE")
         .map((a) => (
-          <div key={a.alertId} className="emergency-bar">
+          <div key={a.alertId} className={`emergency-bar esc-${(a.escalation ?? "none").toLowerCase()}`}>
             <b>{a.type === "FALL" ? "🚨 FALL DETECTED" : "🆘 SOS"}</b>
             <span>
               {a.deviceId.replace("_", " ")} · {a.owner}
             </span>
             <small>{a.message}</small>
+            {a.escalation && (
+              <em className="esc-state">
+                {ESCALATION_TEXT[a.escalation]}
+                {a.ackBy ? `: ${a.ackBy} (${Math.round(((a.ackAt ?? a.ts) - a.ts) / 1000)} s)` : ""}
+              </em>
+            )}
             <small className="mono">{new Date(a.ts).toLocaleTimeString()}</small>
           </div>
         ))}
@@ -106,14 +123,17 @@ export function Dashboard() {
                   <DeviceCard key={d.id} d={d} now={fleet.now} joinUrl={joinUrl} alerts={phoneAlerts} />
                 ))}
               </section>
+              <FleetMap />
             </>
           )}
+          {tab === "rules" && <RulesPanel />}
           {tab === "lake" && (
             <>
               <TimeMachine />
               <LakePanel />
             </>
           )}
+          {tab === "lab" && <AccuracyLab />}
           {tab === "scale" && <VirtualFleet />}
         </div>
         <aside className="side">

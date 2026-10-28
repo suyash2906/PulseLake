@@ -22,7 +22,9 @@ Write-Host "Enabled IoT rules: $($rules -join ', ')"
 
 $o = Get-StackOutputs "pulselake"
 & $AwsExe iam delete-role-policy --role-name $o["GuestRoleName"] --policy-name pulselake-kill-switch-deny --region $Region 2>$null
-& $AwsExe lambda delete-function-concurrency --function-name pulselake-fleet-simulator --region $Region 2>$null
+foreach ($fn in "pulselake-fleet-simulator", "pulselake-action-dispatcher", "pulselake-rule-runner", "pulselake-accuracy-lab") {
+    & $AwsExe lambda delete-function-concurrency --function-name $fn --region $Region 2>$null
+}
 Invoke-Aws ssm put-parameter --name /pulselake/kill-status --value ARMED --type String --overwrite | Out-Null
 Write-Host "Kill switch re-armed. Phones and dashboard can connect again." -ForegroundColor Green
 & "$PSScriptRoot\status.ps1" -Region $Region

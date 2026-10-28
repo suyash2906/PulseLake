@@ -3,7 +3,8 @@
 Triggered by AWS Budgets (via SNS) when the project's real usage cost crosses a threshold.
 If the cost is at/over the cap for the current phase (testing or demo) it:
   1. disables every IoT topic rule named pulselake_*  -> no more SQS/Lambda/S3 work
-  2. blocks the virtual-fleet simulator (reserved concurrency 0)
+  2. blocks the virtual-fleet simulator, the rule runner, the action dispatcher and the
+     Accuracy Lab (reserved concurrency 0)
   3. attaches an explicit Deny iot:* policy to the Cognito guest role -> phones and
      dashboard can no longer connect/publish
 Re-enabling is deliberately manual: scripts/phase.ps1.
@@ -62,10 +63,17 @@ def kill(reason: str) -> dict:
         if not token:
             break
 
-    # stop the virtual-fleet load test from being started (reserved concurrency 0 = cannot run)
-    sim = os.environ.get("SIM_FUNCTION_NAME")
-    if sim:
-        boto3.client("lambda").put_function_concurrency(FunctionName=sim, ReservedConcurrentExecutions=0)
+    # stop the virtual fleet, the rules engine (every-minute runner), the action dispatcher and the
+    # Accuracy Lab: reserved concurrency 0 = the function cannot run at all
+    lam = boto3.client("lambda")
+    stopped = []
+    for fn in [os.environ.get("SIM_FUNCTION_NAME", "")] + os.environ.get("STOP_FUNCTIONS", "").split(","):
+        if fn:
+            try:
+                lam.put_function_concurrency(FunctionName=fn, ReservedConcurrentExecutions=0)
+                stopped.append(fn)
+            except Exception as e:  # keep going: the IoT rules and the deny policy matter most
+                print(f"could not stop {fn}: {e}")
 
     iam.put_role_policy(
         RoleName=GUEST_ROLE,
@@ -76,8 +84,8 @@ def kill(reason: str) -> dict:
     )
     status = f"KILLED {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} - {reason}"
     ssm.put_parameter(Name=STATUS_PARAM, Value=status[:4000], Type="String", Overwrite=True)
-    print(json.dumps({"killed": True, "reason": reason, "rulesDisabled": disabled}))
-    return {"killed": True, "rulesDisabled": disabled, "reason": reason}
+    print(json.dumps({"killed": True, "reason": reason, "rulesDisabled": disabled, "functionsStopped": stopped}))
+    return {"killed": True, "rulesDisabled": disabled, "functionsStopped": stopped, "reason": reason}
 
 
 def handler(event, _context):

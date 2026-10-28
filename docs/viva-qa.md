@@ -146,6 +146,112 @@ sample. The result is exact angles, smooth 60 fps motion and no extra messages, 
 15-20 messages per second would remove the delay but cost about $0.10 per hour per phone, so we chose accuracy at
 zero extra cost.
 
+## Version 3: a data lake that acts
+
+**Q: What is the real use case? Isn't this just a dashboard?**
+No. Version 3 closes the loop: **Sense → Store → Understand → Act.** Phones collect many kinds of data, and the data
+lake stores it all. Rules decide when something matters, and the platform then acts. It notifies the right person's
+phone, escalates if nobody answers, and sends commands back to the device. The same platform serves several use cases
+through rule packs: an elderly parent living alone (the family is alerted), a lone factory worker (the supervisor is
+alerted), a city noise node, and asset tracking. Changing the use case means changing rules, not code.
+
+**Q: Your teacher's scenario: my parents live in another home and one of them falls. What exactly happens?**
+1. The phone detects free fall → impact → stillness and asks "Are you OK?" for 15 s.
+2. With no answer, a FALL_DETECTED event goes to AWS IoT Core. The alert Lambda opens a CRITICAL alert, and the
+   "Family care" rule hands it to the action dispatcher.
+3. That starts a **Step Functions** escalation:
+   - The son's phone gets a push notification even if the app is closed.
+   - The workflow then *waits* for someone to tap "I'm handling it" (task-token callback).
+   - After 60 s with no answer, every family member is notified and an email is sent.
+   - After 2 more minutes, the alert is marked UNANSWERED.
+4. When someone taps "I'm handling it", the workflow resumes and the parent's phone shows "Priya is responding".
+5. The response time is stored in the lake.
+
+**Q: Why can't it call an ambulance automatically?**
+- A browser cannot place phone calls.
+- SMS to Indian numbers requires DLT registration and costs money.
+- Auto-dialling 112 from a prototype would be irresponsible because of false alarms.
+
+Commercial medical-alert systems route alerts to a human response centre for the same reason. Our system escalates to
+people, who get one-tap **Call {parent}**, **Call 112** and **Navigate** buttons. A voice-call integration (e.g. Amazon
+Connect) is future scope.
+
+**Q: How does the system "understand"? You said no AI.**
+Rules plus context, no AI service:
+- **Thresholds held over time.** For example "noise > 85 for 10 s".
+- **Time windows.** For example "only at night".
+- **Geofences.** For example "left the Home zone at night".
+- **Absence.** For example "no movement for 3 hours during the day". The phone first asks "Are you OK?", and only an
+  unanswered question alerts the family.
+- **Personal baselines from the lake.** "Less active than usual" compares today's real steps with that person's own
+  14-day average from the Gold layer. A rule based on the person's own normal is far more meaningful than a fixed
+  number.
+
+**Q: Where does the data lake drive actions?**
+- **Lake rules.** Every hour the rule runner runs Athena SQL over Bronze/Gold (steps vs baseline, daily NIOSH noise
+  dose, repeated falls), and any rows that come back become alerts and actions.
+- **Accuracy Lab.** It uses the lake's raw motion traces to tune the fall detector.
+- **Rule effectiveness.** Every action taken is written back to the lake (bronze/actions), so we can measure how fast
+  people respond (gold_rule_effectiveness).
+
+**Q: How do your rules relate to the AWS IoT Rules Engine?**
+The Rules Engine filters in SQL before anything reaches Lambda. When a user saves a live rule (e.g. noise > 85 on
+PHONE_02), our API *compiles* it into the IoT Rule's `WHERE` clause with `ReplaceTopicRule`. The managed Rules Engine
+then forwards exactly the messages that matter. The dashboard shows the compiled SQL.
+
+**Q: Why Step Functions instead of a simple timer in Lambda?**
+An escalation is a long-running workflow: wait, branch on a human answer, time out, retry with someone else. A Lambda
+cannot wait minutes for a person. Step Functions' *callback pattern* (`.waitForTaskToken`) pauses the workflow at no
+compute cost until `SendTaskSuccess` arrives (the ack) or the timeout fires. It is visible as a graph for every alert,
+and it costs nothing at our volume (4,000 free state transitions a month, about 8 per escalation).
+
+**Q: How do notifications reach a phone when the app is closed, for free?**
+Through **Web Push**:
+1. The Responder app is an installable web app (PWA) with a service worker.
+2. It subscribes with our VAPID public key.
+3. A Node.js Lambda signs each message with the private key, which is kept in SSM Parameter Store as an encrypted
+   SecureString.
+4. The browser's push service (Google for Android, Apple for iPhone) delivers it.
+
+There is no SMS cost. On iPhone it works when the app is added to the Home Screen (iOS 16.4+).
+
+**Q: How are responders authenticated?**
+1. The monitored phone creates a one-time 6-digit pairing code. It is valid for 10 minutes and works once, which proves
+   physical access to the phone.
+2. The responder enters it and receives a random token.
+3. The server stores only the token's SHA-256 hash.
+
+Phones may publish data topics, but only the cloud may publish to `devices/*/commands` (IAM policy).
+
+**Q: What new sensors did you add, and how accurate are they?**
+- **Steps and activity:** peak detection with regularity checks. It counted 49 of 50 steps on a test signal; we verify
+  on the real phone by counting 50 steps.
+- **GPS:** three privacy levels. Location is rounded to about 100 m unless there is an emergency.
+- **Camera heart rate:** photoplethysmography (PPG). The fingertip covers the camera and flash, the brightness pulses
+  with each heartbeat, and autocorrelation finds the period. It is approximate and not a medical device.
+- **Sound bang detection:** adds evidence to a fall.
+
+The temperature and humidity sliders are labelled "virtual sensors": stand-ins for external sensors such as an ESP32.
+
+**Q: How accurate is your fall detection?**
+We measure it instead of claiming it, in the Accuracy Lab:
+1. Each fall candidate uploads a 9.5 s raw accelerometer trace to the lake.
+2. We label the traces (test fall, phone dropped, sat down hard, walking, jump).
+3. A Lambda re-runs the phone's own `fall.ts` code (the same file, bundled for the cloud) over 300 threshold settings
+   and reports sensitivity, specificity and F1.
+4. The best setting is pushed to every phone over the air via the Device Shadow.
+
+*(Quote our measured numbers here.)* The key honest finding: a phone dropped on its own produces the same signal as a
+fall. The accelerometer alone cannot tell them apart, which is exactly why the person gets 15 s to answer "Are you OK?"
+before anyone is alerted.
+
+**Q: The phone must keep the web page open. Isn't that unrealistic?**
+It is the main limit of a web prototype, and we handle it openly:
+- The "monitoring stopped" rule alerts the family when a phone goes silent, so a gap in protection is never silent.
+- A native app or a wearable is the production path.
+
+The cloud side (rules, lake, escalation, push) would stay exactly the same.
+
 ## Cost & security
 
 **Q: How much does it cost?**
@@ -163,7 +269,9 @@ to the lake.
 
 ## Limitations & future scope
 - Guest identities: anyone with the link could join a slot → future: authenticated users / X.509 device
-  certificates.
+  certificates. The dashboard (rules, commands) has no operator login yet → future: Cognito user pool.
+- Web pages cannot sense in the background → future: native Android/iOS app or a wearable (same cloud).
+- No automatic emergency call → future: Amazon Connect voice escalation / a 24x7 response centre.
 - Rule-based detection → future: ML anomaly detection (e.g. Amazon SageMaker / Lookout).
 - Phones simulate temperature/humidity → future: real ESP32/Raspberry Pi sensors (same MQTT topics).
 - Single region → future: multi-region, IoT fleet indexing, Grafana/QuickSight dashboards.

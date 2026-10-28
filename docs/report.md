@@ -6,9 +6,17 @@
 
 ## Abstract
 
-PulseLake is a serverless IoT analytics platform built entirely on AWS. Four smartphones act as IoT devices: they stream
-real motion-sensor readings plus user-controlled environment values over MQTT to AWS IoT Core, and users can inject
-failures (overheat, power surge, crash, network loss). The cloud detects failures in real time, including devices that
+PulseLake is a serverless IoT data-lake platform built entirely on AWS that **senses, stores, understands and acts**.
+Smartphones act as multi-sensor IoT devices: motion, steps and activity, sound level, GPS, camera heart rate and
+battery. They stream to AWS IoT Core, and users can inject failures (overheat, power surge, crash, network loss).
+Version 3 adds a no-code **Rules & Actions engine**:
+- Rules can watch the live stream, geofences, things that did *not* happen, and the lake's history (Athena).
+- Actions reach people: push notifications to a Responder app, with an AWS Step Functions escalation when nobody
+  acknowledges.
+- Actions also reach devices: messages and "Are you OK?" prompts.
+
+The same platform serves different use cases through rule packs (family care, lone worker, city noise, asset
+tracking). The fall detector's accuracy is measured on labelled recordings in an Accuracy Lab. The cloud detects failures in real time, including devices that
 die silently. It also **predicts** an overheat before it happens. It raises alerts on a live dashboard and by email, and
 stores every reading in an S3 data lake organised as Bronze, Silver and Gold layers that is queried with SQL (Amazon
 Athena). The system adds a *time machine* that replays any past session from the lake. A *scalability test* launches up
@@ -34,6 +42,13 @@ manual scaling. The project shows how cloud services solve both needs with no se
 - Query the lake with SQL without managing a database (schema-on-read).
 - Demonstrate elasticity with a large virtual fleet through the same pipeline.
 - Keep the total cost under a hard cap of USD 25 of AWS credits.
+- (v3) **Act on the data:**
+  - user-defined rules over live data, absence and lake history;
+  - notify the right people with acknowledgement and escalation;
+  - send commands back to devices.
+- (v3) Support real use cases through rule packs, e.g. an elderly parent living alone whose children must be told
+  when they fall or stop moving.
+- (v3) Measure detection accuracy on recorded data instead of claiming it.
 
 ## 3. Cloud computing concepts demonstrated
 
@@ -49,6 +64,10 @@ manual scaling. The project shows how cloud services solve both needs with no se
 | Edge computing | Each phone reads its accelerometer ~60×/s and sends a 1-per-second summary (~98% less data) |
 | Security / identity | Cognito temporary credentials, SigV4 signing, least-privilege IAM roles, private buckets |
 | Cost governance (FinOps) | AWS Budgets, automatic kill switch, scan caps, auto-sleep, teardown |
+| Workflow orchestration (v3) | AWS Step Functions escalation with the task-token callback pattern (human in the loop) |
+| Closed-loop analytics (v3) | Lake (Athena) rules trigger actions; every action is written back to the lake and measured |
+| Push messaging (v3) | Web Push (VAPID) from Lambda to an installable web app; keys in SSM SecureString |
+| Edge ↔ cloud model loop (v3) | Cloud re-runs the edge detector on lake data, pushes tuned thresholds via Device Shadow |
 
 ## 4. Architecture
 
@@ -104,7 +123,10 @@ manual scaling. The project shows how cloud services solve both needs with no se
 | AWS Budgets | Cost tracking and alerts at $5 / $8 / $9 / $18 / $22 |
 | AWS Systems Manager Parameter Store | Phase, kill-switch, ETL and load-test status |
 | Amazon CloudWatch Logs | Lambda logs with 7-day retention |
-| AWS IAM | 9 least-privilege roles |
+| AWS IAM | 14 least-privilege roles |
+| AWS Step Functions (v3) | Escalation workflow: notify → wait for acknowledgement → escalate → UNANSWERED |
+| AWS Lambda (v3, +3) | rule-runner (Python), action-dispatcher and accuracy-lab (Node.js 22, bundled with esbuild) |
+| Amazon DynamoDB (v3) | Single-table `pulselake-platform`: rules, responders, pairing codes, zones, escalations, actions, lab |
 
 ## 6. Implementation
 
@@ -173,6 +195,79 @@ Two CloudFormation stacks: `pulselake-budget` (deployed first) and `pulselake`. 
 everything; another deletes everything. Cost is protected in five layers: the AWS Free plan (the card cannot be
 charged), AWS Budgets alerts, the kill switch, behaviour limits (auto-sleep, scan caps, load-test limits), and teardown.
 
+### 6.9 Version 3: more sensors on the phone (Sense)
+- **Steps and activity:** the acceleration magnitude is smoothed and compared with its slow average (gravity). A step
+  is a peak above +1.2 m/s² after a dip below +0.2 m/s². Only *regular* runs of four or more steps, 0.25-2 s apart,
+  count, so a single bump never does. Activity (still / walking / active) comes from cadence and movement RMS, and
+  "seconds without movement" is sent with every message.
+- **GPS with privacy levels:** off, emergency only, or always (rounded to ~100 m, exact during an emergency). Named
+  zones (Home, Site, Depot) are saved from the phone for geofence rules.
+- **Camera heart rate (PPG):** a fingertip covers the rear camera and flash, and the red brightness is sampled at
+  ~30 fps for 20 s. The signal is resampled, detrended and smoothed, then autocorrelation over 40-200 bpm finds the
+  pulse period. A quality score rejects weak signals. Only the number is sent. The reading is approximate, not
+  medical.
+- **Sound bang:** a jump of 15 dB or more to at least 75 dB(A) at the moment of impact adds evidence to a fall.
+- **Commands from the cloud:** a message, an "Are you OK?" prompt, "help is coming", and a sampling-rate boost.
+
+### 6.10 Rules & Actions engine (Understand + Act)
+Rules live in a single DynamoDB table and are built without code in the dashboard. There are five kinds:
+
+| Kind | Evaluated by | Example |
+|---|---|---|
+| Live | Alert Lambda, on every forwarded message | heart rate > 120 bpm; noise > 85 dB(A) for 10 s |
+| Zone | Alert Lambda (haversine distance) | leaves zone "Home" between 22:00 and 06:00 |
+| Absence | Rule-runner Lambda, every minute | no movement for 3 h during the day (first asks "Are you OK?"); no data for 10 min; battery < 15% and not charging |
+| Lake | Rule-runner Lambda → Athena | steps today below 60% of the person's own 14-day average; daily noise dose > 50%; ≥ 2 falls in 7 days |
+| On alert | Alert Lambda | fall or SOS → push + escalate + email |
+
+- **Compiled into the IoT Rule.** Live-rule thresholds are compiled into the `WHERE` clause of the AWS IoT Rule
+  (`ReplaceTopicRule`), so the managed Rules Engine forwards only the messages that matter.
+- **Packs.** Use-case packs install a set of rules on chosen devices:
+  - Family care: 9 rules.
+  - Lone worker: 5 rules.
+  - City noise: 3 rules.
+  - Asset tracking: 4 rules.
+- **Actions.** These run in a Node.js *action dispatcher*:
+  - Web Push to the device's responders;
+  - a Step Functions escalation;
+  - email;
+  - device commands.
+- **Action log.** Every action is logged to `bronze/actions`, a recent-actions table, and the MQTT topic
+  `pulselake/actions` (live action log).
+
+### 6.11 Responders and escalation
+- **Responder app.** The people who receive alerts use an installable web app (`responder.html`).
+- **Pairing.** It pairs with a 6-digit one-time code created on the monitored phone (valid 10 minutes, single use).
+  The server stores only a hash of the responder's token.
+- **Push.** The app subscribes to Web Push with the platform's VAPID key, so alerts arrive even when it is closed.
+- **Responding.** An alert shows the evidence and a map, plus **I'm handling it**, **Call**, **Call 112** and
+  **Navigate**.
+- **Escalation workflow.** An AWS Step Functions workflow uses the callback pattern:
+  1. Notify level-1 responders and wait up to 60 s for a task-token callback.
+  2. Otherwise notify everyone and send an email, then wait 120 s.
+  3. Otherwise mark the alert UNANSWERED.
+- **Acknowledgement.** "I'm handling it" calls `SendTaskSuccess`. The parent's phone then shows "Priya is responding",
+  and the response time is stored in the lake (`gold_rule_effectiveness`).
+
+### 6.12 Accuracy Lab
+1. Every fall candidate (free fall, or an impact above 2.2 g) uploads a 9.5 s raw accelerometer trace to
+   `bronze/traces` through a dedicated IoT Rule.
+2. Traces are labelled in the dashboard.
+3. A Node.js Lambda runs the **same `fall.ts` file the phones run** (bundled with esbuild) over every labelled trace for
+   300 threshold settings. It reports the confusion matrix, sensitivity, specificity and F1.
+4. The best setting is pushed to all phones through the Device Shadow's desired state.
+
+### 6.13 Lake additions
+- **New Bronze datasets:** `bronze_traces` and `bronze_actions`.
+- **New Silver columns:** steps, activity, still time, GPS.
+- **New Gold views:**
+  - `gold_daily_activity`
+  - `gold_baseline` (14-day mean and standard deviation per person)
+  - `gold_heart_rate`
+  - `gold_rule_effectiveness`
+- **Demo history:** a *backfill* mode of the fleet simulator writes 14 days of clearly labelled synthetic history
+  (`sensors = 'synthetic'`), so baseline rules have a personal "normal" to compare today's real data against.
+
 ## 7. Results (measured)
 
 | Test | Result |
@@ -223,7 +318,15 @@ cost optimisation that fits this data.
 
 ## 11. Limitations and future scope
 
-- Guest identities: anyone with the link can join a slot. *Future:* authenticated users or X.509 device certificates.
+- Guest identities: anyone with the link can join a slot, and the dashboard has no operator login. *Future:*
+  authenticated users (Cognito user pool) or X.509 device certificates.
+- A web page cannot sense in the background. The platform raises "monitoring stopped" when a phone goes silent.
+  *Future:* a native app or a wearable, using the same cloud.
+- No automatic emergency-service call: browsers cannot place calls, and SMS to India needs DLT registration. The
+  platform escalates to people who call with one tap. *Future:* Amazon Connect voice escalation or a 24x7 response
+  centre.
+- A phone dropped on its own is indistinguishable from a fall for the accelerometer. That is why the 15 s
+  "Are you OK?" step exists.
 - Rule-based and linear-trend detection. *Future:* machine-learning anomaly detection.
 - Temperature/humidity are simulated on phones. *Future:* ESP32 / Raspberry Pi sensors on the same MQTT topics.
 - Single region. *Future:* multi-region replication, IoT fleet indexing, Grafana dashboards.
@@ -232,8 +335,12 @@ cost optimisation that fits this data.
 
 PulseLake shows that a complete real-time IoT analytics platform can be built entirely from managed cloud services,
 without a single server. It covers live monitoring, cloud-side failure detection and prediction, a layered data lake with
-SQL analytics, history replay, and elastic scaling. It costs cents to run and can be recreated or deleted with one
-command.
+SQL analytics, history replay, and elastic scaling.
+
+Version 3 closes the loop from data to action. Rules over live data, absence and lake history reach real people's
+phones, escalate through a workflow when nobody answers, and send commands back to devices. The detector's accuracy is
+measured on the lake's own recordings. The same platform serves several use cases by changing rules, not code. It costs
+cents to run and can be recreated or deleted with one command.
 
 ## References
 - AWS IoT Core Developer Guide: MQTT, rules, lifecycle events, device shadows

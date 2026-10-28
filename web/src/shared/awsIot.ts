@@ -12,6 +12,10 @@ export interface AppConfig {
   iotEndpoint: string; // xxxxx-ats.iot.<region>.amazonaws.com
   analyticsUrl?: string;
   deviceUrl?: string;
+  webUrl?: string;
+  vapidPublicKey?: string; // Web Push (Responder app)
+  responderUrl?: string;
+  escalationArn?: string; // Step Functions state machine (links to executions)
   stage?: string;
 }
 

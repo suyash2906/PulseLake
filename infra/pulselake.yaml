@@ -113,11 +113,14 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/PHONE_0*"
                   - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/dash-*"
+              # phones may publish data, never commands: pulselake/devices/*/commands is cloud-only
               - Sid: PublishDeviceTopics
                 Effect: Allow
                 Action: iot:Publish
                 Resource:
-                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*/telemetry"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*/events"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*/traces"
               - Sid: SubscribeProjectAndPresence
                 Effect: Allow
                 Action: iot:Subscribe
@@ -210,7 +213,11 @@ Resources:
                 Resource: !GetAtt GuestRole.Arn
               - Effect: Allow
                 Action: lambda:PutFunctionConcurrency
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-fleet-simulator"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-fleet-simulator"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-action-dispatcher"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-rule-runner"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-accuracy-lab"
               - Effect: Allow
                 Action: [ssm:GetParameter, ssm:PutParameter]
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*"
@@ -240,6 +247,7 @@ Resources:
           TESTING_CAP: !Ref TestingCapUsd
           DEMO_CAP: !Ref DemoCapUsd
           SIM_FUNCTION_NAME: !Sub "${ProjectName}-fleet-simulator"
+          STOP_FUNCTIONS: !Sub "${ProjectName}-action-dispatcher,${ProjectName}-rule-runner,${ProjectName}-accuracy-lab"
 
   KillSwitchSubscription:
     Type: AWS::SNS::Subscription
@@ -271,6 +279,24 @@ Resources:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub "${ProjectName}-alerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # v3 single-table design: rules, responders + device links, pairing codes, zones, escalation
+  # state, recent actions, Accuracy Lab labels/results. pk/sk patterns are documented in
+  # backend/analytics_api/platform_api.py.
+  PlatformTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-platform"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - { AttributeName: pk, AttributeType: S }
@@ -315,6 +341,9 @@ Resources:
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: [!GetAtt DevicesTable.Arn, !GetAtt AlertsTable.Arn]
               - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt PlatformTable.Arn
+              - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref AlertTopic
               - Effect: Allow
@@ -323,6 +352,9 @@ Resources:
               - Effect: Allow
                 Action: iot:Publish
                 Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/alerts"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-action-dispatcher"
 
   AlertProcessorLogs:
     Type: AWS::Logs::LogGroup
@@ -339,13 +371,15 @@ Resources:
       Handler: app.handler
       Code: ../backend/alert_processor
       Role: !GetAtt AlertProcessorRole.Arn
-      Timeout: 15
+      Timeout: 20
       MemorySize: 256
       Environment:
         Variables:
           DEVICES_TABLE: !Ref DevicesTable
           ALERTS_TABLE: !Ref AlertsTable
           ALERT_TOPIC_ARN: !Ref AlertTopic
+          PLATFORM_TABLE: !Ref PlatformTable
+          DISPATCHER_FUNCTION: !Sub "${ProjectName}-action-dispatcher"
 
   # Real-time alerts must never be replayed minutes later: no async retries, drop stale events.
   AlertProcessorInvokeConfig:
@@ -447,6 +481,25 @@ Resources:
         ErrorAction:
           Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
 
+  # v3: raw accelerometer windows around fall candidates -> lake (Accuracy Lab). The object key
+  # carries the metadata so the lab can list traces without opening them.
+  RuleTraces:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub "${ProjectName}_traces"
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Description: Fall-candidate accelerometer traces -> S3 bronze/traces
+        Sql: "SELECT *, timestamp() AS ingest_ts FROM 'pulselake/devices/+/traces'"
+        RuleDisabled: false
+        Actions:
+          - S3:
+              BucketName: !Ref LakeBucket
+              RoleArn: !GetAtt IotRuleRole.Arn
+              Key: bronze/traces/dt=${parse_time("yyyy-MM-dd", timestamp(), "UTC")}/${id}__${ts}__${traceId}__${peakG}__${detected}__${trigger}.json
+        ErrorAction:
+          Republish: { Topic: pulselake/rule-errors, RoleArn: !GetAtt IotRuleRole.Arn, Qos: 0 }
+
   # ================================================================== PHASE 3: data lake
   LakeBucket:
     Type: AWS::S3::Bucket
@@ -463,6 +516,14 @@ Resources:
             Status: Enabled
             Prefix: athena-results/
             ExpirationInDays: 7
+          - Id: expire-raw-traces # privacy: raw motion recordings are kept 30 days, results stay
+            Status: Enabled
+            Prefix: bronze/traces/
+            ExpirationInDays: 30
+          - Id: expire-exports # download links for exported Gold reports
+            Status: Enabled
+            Prefix: exports/
+            ExpirationInDays: 1
   # Ingestion buffer (Firehose/Kinesis are not available on the AWS Free plan):
   # IoT Rule -> SQS queue -> Lambda "lake writer" invoked once per ~60 s with the whole
   # batch -> ONE JSON-lines file per minute in S3 (avoids the tiny-file problem).
@@ -496,6 +557,31 @@ Resources:
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub "${LakeBucket.Arn}/bronze/telemetry/*"
+              - Effect: Allow # speed layer (per-minute aggregates)
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt SpeedTable.Arn
+              - Effect: Allow # streaming anomaly detection state (EWMA per device)
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AlertProcessorFunction.Arn
+
+  # Speed layer of the Lambda architecture: per-device, per-minute aggregates (2-day TTL)
+  SpeedTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-speed"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: deviceId, AttributeType: S }
+        - { AttributeName: minute, AttributeType: N }
+      KeySchema:
+        - { AttributeName: deviceId, KeyType: HASH }
+        - { AttributeName: minute, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   LakeWriterLogs:
     Type: AWS::Logs::LogGroup
@@ -517,6 +603,9 @@ Resources:
       Environment:
         Variables:
           LAKE_BUCKET: !Ref LakeBucket
+          SPEED_TABLE: !Ref SpeedTable
+          DEVICES_TABLE: !Ref DevicesTable
+          ALERT_FUNCTION: !Ref AlertProcessorFunction
 
   LakeWriterTrigger:
     Type: AWS::Lambda::EventSourceMapping
@@ -623,6 +712,17 @@ Resources:
             - { Name: q, Type: "array<array<double>>" }
             - { Name: noise, Type: double }
             - { Name: noisemax, Type: double }
+            - { Name: steps, Type: int }
+            - { Name: stepsday, Type: int }
+            - { Name: act, Type: string }
+            - { Name: stillsec, Type: double }
+            - { Name: lat, Type: double }
+            - { Name: lon, Type: double }
+            - { Name: gacc, Type: double }
+            - { Name: spd, Type: double }
+            - { Name: ext, Type: "map<string,double>" }
+            - { Name: bg, Type: boolean }
+            - { Name: mp, Type: boolean }
             - { Name: sensors, Type: string }
             - { Name: thing, Type: string }
             - { Name: ingest_ts, Type: bigint }
@@ -665,6 +765,12 @@ Resources:
             - { Name: impactg, Type: double }
             - { Name: freefallms, Type: double }
             - { Name: anglechange, Type: double }
+            - { Name: confidence, Type: double }
+            - { Name: bpm, Type: double }
+            - { Name: quality, Type: double }
+            - { Name: reason, Type: string }
+            - { Name: lat, Type: double }
+            - { Name: lon, Type: double }
             - { Name: ingest_ts, Type: bigint }
 
   BronzeAlertsTable:
@@ -705,6 +811,136 @@ Resources:
             - { Name: message, Type: string }
             - { Name: source, Type: string }
             - { Name: resolvedat, Type: bigint }
+            - { Name: ruleid, Type: string }
+            - { Name: rulename, Type: string }
+            - { Name: escalation, Type: string }
+            - { Name: ackby, Type: string }
+            - { Name: ackat, Type: bigint }
+
+  BronzeTracesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: bronze_traces
+        Description: Raw accelerometer windows (3 s before - 6.5 s after) around fall candidates
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${LakeBucket}/bronze/traces/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/bronze/traces/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: id, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: profile, Type: string }
+            - { Name: ts, Type: bigint }
+            - { Name: traceid, Type: string }
+            - { Name: trigger, Type: string }
+            - { Name: peakg, Type: double }
+            - { Name: ming, Type: double }
+            - { Name: detected, Type: boolean }
+            - { Name: fallconfig, Type: string }
+            - { Name: samples, Type: "array<array<double>>" }
+            - { Name: ingest_ts, Type: bigint }
+
+  BronzeActionsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: bronze_actions
+        Description: Every action the platform took (push, escalation, command, acknowledgement)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${LakeBucket}/bronze/actions/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/bronze/actions/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: ts, Type: bigint }
+            - { Name: action, Type: string }
+            - { Name: status, Type: string }
+            - { Name: deviceid, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: alertid, Type: string }
+            - { Name: alerttype, Type: string }
+            - { Name: ruleid, Type: string }
+            - { Name: rulename, Type: string }
+            - { Name: target, Type: string }
+            - { Name: level, Type: int }
+            - { Name: detail, Type: string }
+            - { Name: ackms, Type: bigint }
+
+  # Data-quality profile of every ETL run (written by the ETL) -> view gold_data_quality
+  DqRunsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeDatabase
+      TableInput:
+        Name: dq_runs
+        Description: Data quality per ETL run and device (received, duplicates, invalid, late, latency)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${LakeBucket}/quality/runs/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/quality/runs/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: { ignore.malformed.json: "true" }
+          Columns:
+            - { Name: run_at, Type: bigint }
+            - { Name: mode, Type: string }
+            - { Name: device_id, Type: string }
+            - { Name: owner, Type: string }
+            - { Name: received, Type: bigint }
+            - { Name: duplicates, Type: bigint }
+            - { Name: invalid, Type: bigint }
+            - { Name: late, Type: bigint }
+            - { Name: clock_ahead, Type: bigint }
+            - { Name: missing_fields, Type: bigint }
+            - { Name: avg_latency_ms, Type: double }
+            - { Name: quality_pct, Type: double }
 
   AthenaWorkGroup:
     Type: AWS::Athena::WorkGroup
@@ -725,12 +961,12 @@ Resources:
     Type: AWS::Athena::WorkGroup
     Properties:
       Name: !Sub "${ProjectName}-etl"
-      Description: PulseLake ETL (bronze -> silver -> gold), capped at 100 MB per query
+      Description: PulseLake ETL (bronze -> silver -> gold), capped at 500 MB per query (~$0.0025)
       RecursiveDeleteOption: true
       WorkGroupConfiguration:
         EnforceWorkGroupConfiguration: false
         PublishCloudWatchMetricsEnabled: false
-        BytesScannedCutoffPerQuery: 104857600
+        BytesScannedCutoffPerQuery: 524288000 # raw JSON is scanned whole; a demo day of 4 phones is ~60 MB
         ResultConfiguration:
           OutputLocation: !Sub "s3://${LakeBucket}/athena-results/etl/"
 
@@ -771,7 +1007,33 @@ Resources:
                 Resource: !Sub "${LakeBucket.Arn}/athena-results/*"
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: [!GetAtt LakeEtlFunction.Arn, !GetAtt FleetSimulatorFunction.Arn]
+                Resource:
+                  - !GetAtt LakeEtlFunction.Arn
+                  - !GetAtt FleetSimulatorFunction.Arn
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-action-dispatcher"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-rule-runner"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-accuracy-lab"
+              # v3 platform: rules, responders, zones, lab labels (the analytics role stays read-only on the lake)
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                         dynamodb:Scan, dynamodb:BatchGetItem]
+                Resource: !GetAtt PlatformTable.Arn
+              - Effect: Allow
+                Action: dynamodb:BatchGetItem
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow # speed layer read (Lambda architecture panel)
+                Action: dynamodb:Query
+                Resource: !GetAtt SpeedTable.Arn
+              - Effect: Allow # UNLOAD of Gold reports for download (expire after 1 day)
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${LakeBucket.Arn}/exports/*"
+              # rules compiler: user rules become part of the IoT Rule SQL
+              - Effect: Allow
+                Action: [iot:GetTopicRule, iot:ReplaceTopicRule]
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}_telemetry_alerts"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt IotRuleRole.Arn
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource:
@@ -830,7 +1092,8 @@ Resources:
                 Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
               - Effect: Allow
                 Action: [s3:PutObject, s3:DeleteObject]
-                Resource: [!Sub "${LakeBucket.Arn}/silver/*", !Sub "${LakeBucket.Arn}/athena-results/*"]
+                Resource: [!Sub "${LakeBucket.Arn}/silver/*", !Sub "${LakeBucket.Arn}/athena-results/*",
+                           !Sub "${LakeBucket.Arn}/quality/*"]
               - Effect: Allow
                 Action: ssm:PutParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/etl-status"
@@ -927,6 +1190,11 @@ Resources:
               - Effect: Allow
                 Action: ssm:PutParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/sim-status"
+              - Effect: Allow # backfill mode: labelled synthetic history straight into Bronze
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "${LakeBucket.Arn}/bronze/telemetry/*"
+                  - !Sub "${LakeBucket.Arn}/bronze/events/*"
 
   FleetSimulatorLogs:
     Type: AWS::Logs::LogGroup
@@ -948,6 +1216,7 @@ Resources:
       Environment:
         Variables:
           SIM_STATUS_PARAM: !Ref SimStatusParameter
+          LAKE_BUCKET: !Ref LakeBucket
 
   FleetSimulatorInvokeConfig:
     Type: AWS::Lambda::EventInvokeConfig
@@ -985,6 +1254,12 @@ Resources:
           SIM_FUNCTION: !Ref FleetSimulatorFunction
           SIM_STATUS_PARAM: !Ref SimStatusParameter
           PHASE_PARAM: !Ref PhaseParameter
+          PLATFORM_TABLE: !Ref PlatformTable
+          DISPATCHER_FUNCTION: !Sub "${ProjectName}-action-dispatcher"
+          RULE_RUNNER_FUNCTION: !Sub "${ProjectName}-rule-runner"
+          ACCURACY_LAB_FUNCTION: !Sub "${ProjectName}-accuracy-lab"
+          TELEMETRY_RULE_NAME: !Sub "${ProjectName}_telemetry_alerts"
+          SPEED_TABLE: !Ref SpeedTable
 
   AnalyticsUrl:
     Type: AWS::Lambda::Url
@@ -994,7 +1269,7 @@ Resources:
       Cors:
         AllowOrigins: ["*"]
         AllowMethods: [GET, POST]
-        AllowHeaders: [content-type]
+        AllowHeaders: [content-type, authorization]
         MaxAge: 3600
 
   AnalyticsUrlPermission:
@@ -1013,6 +1288,333 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: "*"
       InvokedViaFunctionUrl: true
+
+  # ================================================================== v3: ACT - rules, actions, escalation
+  # Action dispatcher (Node.js): Web Push to responders, Step Functions escalation, device commands,
+  # email; every action is logged to the lake (bronze/actions) and to MQTT pulselake/actions.
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: action-dispatcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:BatchGetItem]
+                Resource: !GetAtt PlatformTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-escalation"
+              - Effect: Allow # task-token callbacks have no resource type
+                Action: [states:SendTaskSuccess, states:SendTaskFailure]
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${LakeBucket.Arn}/bronze/actions/*"
+              - Effect: Allow
+                Action: iot:DescribeEndpoint
+                Resource: "*"
+              - Effect: Allow
+                Action: iot:Publish
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/actions"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/alerts"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/pulselake/devices/*/commands"
+              - Effect: Allow # VAPID keys for Web Push (SecureString created by scripts/deploy.ps1)
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/vapid"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals: { "kms:ViaService": !Sub "ssm.${AWS::Region}.amazonaws.com" }
+
+  DispatcherLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-action-dispatcher"
+      RetentionInDays: 7
+
+  DispatcherFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DispatcherLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-action-dispatcher"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Code: ../.build/lambda/action_dispatcher # bundled by scripts/build-lambdas.mjs
+      Role: !GetAtt DispatcherRole.Arn
+      Timeout: 25
+      MemorySize: 256
+      Environment:
+        Variables:
+          PLATFORM_TABLE: !Ref PlatformTable
+          ALERTS_TABLE: !Ref AlertsTable
+          LAKE_BUCKET: !Ref LakeBucket
+          STATE_MACHINE_ARN: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-escalation"
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          VAPID_PARAM: !Sub "/${ProjectName}/vapid"
+          WEB_URL: !Sub "https://${WebDistribution.DomainName}"
+
+  DispatcherInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref DispatcherFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0 # never send the same notification twice
+      MaximumEventAgeInSeconds: 120
+
+  # Escalation workflow: notify level 1 and WAIT for "I'm handling it" (task token); after 60 s
+  # escalate to level 2 + email; after 120 s more mark the alert UNANSWERED.
+  EscalationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-dispatcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DispatcherFunction.Arn
+
+  EscalationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-escalation"
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt EscalationRole.Arn
+      DefinitionSubstitutions:
+        Dispatcher: !GetAtt DispatcherFunction.Arn
+      Definition:
+        Comment: PulseLake escalation - notify, wait for an acknowledgement, escalate, give up
+        StartAt: NotifyLevel1
+        States:
+          NotifyLevel1:
+            Type: Task
+            Comment: Push to the level-1 responders, then wait for someone to tap "I'm handling it"
+            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+            Parameters:
+              FunctionName: ${Dispatcher}
+              Payload:
+                mode: escalation-notify
+                level: 1
+                token.$: $$.Task.Token
+                alert.$: $.alert
+            TimeoutSeconds: 60
+            ResultPath: $.answer
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.level1
+                Next: NotifyLevel2
+            Next: Handled
+          NotifyLevel2:
+            Type: Task
+            Comment: Nobody answered in 60 s - alert every responder + email
+            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+            Parameters:
+              FunctionName: ${Dispatcher}
+              Payload:
+                mode: escalation-notify
+                level: 2
+                token.$: $$.Task.Token
+                alert.$: $.alert
+            TimeoutSeconds: 120
+            ResultPath: $.answer
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.level2
+                Next: MarkUnanswered
+            Next: Handled
+          MarkUnanswered:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${Dispatcher}
+              Payload:
+                mode: escalation-unanswered
+                alert.$: $.alert
+            ResultPath: $.unanswered
+            Next: NobodyAnswered
+          NobodyAnswered:
+            Type: Fail
+            Error: Unanswered
+            Cause: No responder acknowledged the alert within 3 minutes
+          Handled:
+            Type: Succeed
+
+  # Rule runner: absence rules (no movement, no data, battery) + lake rules (Athena) every minute
+  RuleRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: rule-runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:UpdateItem]
+                Resource: !GetAtt PlatformTable.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt AlertProcessorFunction.Arn, !GetAtt DispatcherFunction.Arn]
+              - Effect: Allow
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults,
+                         athena:StopQueryExecution]
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions]
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LakeDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LakeDatabase}/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${LakeBucket.Arn}/athena-results/*"
+
+  RuleRunnerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-rule-runner"
+      RetentionInDays: 7
+
+  RuleRunnerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RuleRunnerLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-rule-runner"
+      Runtime: python3.12
+      Handler: app.handler
+      Code: ../backend/rule_runner
+      Role: !GetAtt RuleRunnerRole.Arn
+      Timeout: 55
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEVICES_TABLE: !Ref DevicesTable
+          PLATFORM_TABLE: !Ref PlatformTable
+          ALERT_FUNCTION: !Ref AlertProcessorFunction
+          DISPATCHER_FUNCTION: !Ref DispatcherFunction
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+          GLUE_DATABASE: !Ref LakeDatabase
+          LAKE_BUCKET: !Ref LakeBucket
+
+  RuleRunnerSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-rule-runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt RuleRunnerFunction.Arn
+
+  RuleRunnerSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-rule-runner"
+      Description: Absence + lake rules every minute (43k invocations/month - Lambda free tier)
+      ScheduleExpression: rate(1 minute)
+      FlexibleTimeWindow: { Mode: "OFF" }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt RuleRunnerFunction.Arn
+        RoleArn: !GetAtt RuleRunnerSchedulerRole.Arn
+        Input: '{"trigger":"schedule"}'
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  # Accuracy Lab (Node.js): re-runs the phones' own fall detector over labelled traces
+  AccuracyLabRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: accuracy-lab
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem]
+                Resource: !GetAtt PlatformTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${LakeBucket.Arn}/bronze/traces/*"
+
+  AccuracyLabLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-accuracy-lab"
+      RetentionInDays: 7
+
+  AccuracyLabFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AccuracyLabLogs
+    Properties:
+      FunctionName: !Sub "${ProjectName}-accuracy-lab"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Code: ../.build/lambda/accuracy_lab # bundled with web/src/device/fall.ts
+      Role: !GetAtt AccuracyLabRole.Arn
+      Timeout: 28
+      MemorySize: 1024
+      Environment:
+        Variables:
+          PLATFORM_TABLE: !Ref PlatformTable
+          LAKE_BUCKET: !Ref LakeBucket
 
 Outputs:
   AnalyticsUrl:
@@ -1035,3 +1637,7 @@ Outputs:
     Value: !Sub "https://${WebDistribution.DomainName}"
   KillSwitchFunctionName:
     Value: !Ref KillSwitchFunction
+  EscalationStateMachineArn:
+    Value: !Ref EscalationStateMachine
+  PlatformTableName:
+    Value: !Ref PlatformTable

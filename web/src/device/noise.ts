@@ -25,8 +25,15 @@ export class NoiseMeter {
   private bins: Float32Array<ArrayBuffer> = new Float32Array(0);
   private weights: Float32Array<ArrayBuffer> = new Float32Array(0);
   private windowLevels: number[] = []; // 100 ms levels since the last takeSecond()
+  private prevLevel = 0;
+  private bangAt = -Infinity; // performance.now() of the last sudden loud sound
   level: number | null = null; // latest 100 ms level, approx. dB(A)
   calibration = readCalibration();
+
+  /** A sudden jump of 15+ dB to 75+ dB(A) near time t (e.g. a body or phone hitting the floor). */
+  bangNear(t: number, withinMs = 1200) {
+    return this.running && Math.abs(t - this.bangAt) <= withinMs;
+  }
 
   get running() {
     return !!this.ctx;
@@ -90,6 +97,8 @@ export class NoiseMeter {
     }
     const level = power > 0 ? 10 * Math.log10(power) + this.calibration : 0;
     this.level = round1(Math.max(0, level));
+    if (this.level - this.prevLevel >= 15 && this.level >= 75) this.bangAt = performance.now();
+    this.prevLevel = this.level;
     this.windowLevels.push(this.level);
     if (this.windowLevels.length > 50) this.windowLevels.shift();
   };

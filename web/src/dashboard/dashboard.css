@@ -922,7 +922,7 @@ tbody tr:hover { background: rgba(76, 201, 240, 0.05); }
 }
 .pipe-canvas {
   width: 100%;
-  height: clamp(200px, 22vw, 290px);
+  height: clamp(250px, 29vw, 385px);
   display: block;
 }
 .pipe-legend {

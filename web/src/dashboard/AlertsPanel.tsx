@@ -8,7 +8,10 @@ const SOURCE_LABEL: Record<string, string> = {
   PRESENCE: "AWS presence",
   DEVICE_FAULT: "device",
   EDGE: "the phone (edge)",
+  USER_RULE: "your rule",
+  LAKE_RULE: "data-lake rule (Athena)",
 };
+const ESC: Record<string, string> = { LEVEL1: "⏳ level 1", LEVEL2: "⏰ level 2", UNANSWERED: "‼️ unanswered", ACKED: "✅ handled" };
 
 export function AlertsPanel({ alerts, sound, now }: { alerts: Alert[]; sound: boolean; now: number }) {
   const seen = useRef(new Set<string>());
@@ -42,11 +45,17 @@ export function AlertsPanel({ alerts, sound, now }: { alerts: Alert[]; sound: bo
         {alerts.slice(0, 30).map((a) => (
           <li key={a.alertId} className={`al sev-${a.severity.toLowerCase()} st-${a.status.toLowerCase()}`}>
             <div className="al-top">
-              <b>{a.type.replace(/_/g, " ")}</b>
+              <b>{a.ruleName ?? a.type.replace(/_/g, " ")}</b>
               <span className="al-dev">{a.deviceId.replace("_", " ")}</span>
               <span className={`al-st`}>{a.status}</span>
             </div>
             <p>{a.message}</p>
+            {a.escalation && (
+              <div className={`al-esc e-${a.escalation.toLowerCase()}`}>
+                {ESC[a.escalation]}
+                {a.ackBy ? ` by ${a.ackBy} in ${Math.round(((a.ackAt ?? a.ts) - a.ts) / 1000)} s` : ""}
+              </div>
+            )}
             {a.type === "PREDICTED_OVERHEAT" && a.status === "ACTIVE" && a.etaSec !== undefined && (
               <div className="al-eta mono">⏳ limit in ~{Math.max(0, Math.round(a.etaSec - (now - a.ts) / 1000))} s</div>
             )}

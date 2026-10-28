@@ -1,0 +1,19 @@
+{
+  // Type-checks the Node.js Lambdas (bundled by scripts/build-lambdas.mjs, not by tsc).
+  // Run from the web folder: npx tsc -p ../backend
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "baseUrl": ".",
+    "paths": { "*": ["../web/node_modules/@types/*", "../web/node_modules/*"] },
+    "typeRoots": ["../web/node_modules/@types"],
+    "types": ["node"]
+  },
+  "include": ["action_dispatcher/*.ts", "accuracy_lab/*.ts"]
+}

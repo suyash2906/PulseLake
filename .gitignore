@@ -7,3 +7,6 @@ web/public/config.json
 __pycache__/
 .pulselake.json
 *.tsbuildinfo
+
+# Word exports of the report and script (shared separately)
+docs/*.docx

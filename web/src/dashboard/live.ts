@@ -1,7 +1,7 @@
 // Dashboard's live MQTT feed: one connection, all topics -> fleet store.
 import { useEffect, useState } from "react";
 import { connectIot, type ConnState, type IotConnection } from "../shared/awsIot";
-import { TOPICS, type Alert, type DeviceEvent, type PresenceEvent, type Telemetry } from "../shared/types";
+import { TOPICS, type ActionLog, type Alert, type DeviceEvent, type PresenceEvent, type Telemetry } from "../shared/types";
 import { fleet } from "./store";
 
 let connection: IotConnection | null = null;
@@ -20,7 +20,7 @@ export function useLiveFeed() {
       .then((c) => {
         if (cancelled) return c.close();
         connection = c;
-        c.client.subscribe([TOPICS.allTelemetry, TOPICS.allEvents, TOPICS.alerts, TOPICS.presence], { qos: 0 });
+        c.client.subscribe([TOPICS.allTelemetry, TOPICS.allEvents, TOPICS.alerts, TOPICS.actions, TOPICS.presence], { qos: 0 });
         c.client.on("message", (topic, payload) => {
           if (fleet.mode === "replay") return; // the time machine owns the screen
           let msg: any;
@@ -32,6 +32,7 @@ export function useLiveFeed() {
           if (topic.endsWith("/telemetry")) fleet.telemetry(msg as Telemetry);
           else if (topic.endsWith("/events")) fleet.event(msg as DeviceEvent);
           else if (topic === TOPICS.alerts) fleet.alert(msg as Alert);
+          else if (topic === TOPICS.actions) fleet.action(msg as ActionLog);
           else if (topic.startsWith("$aws/events/presence/")) fleet.presence(msg as PresenceEvent);
         });
       })

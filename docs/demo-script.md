@@ -1,44 +1,64 @@
-# PulseLake: Demo-Day Script (≈ 10 minutes)
+# PulseLake: Demo-Day Script (about 12 minutes)
+
+The story: **a data lake that senses, understands and acts.** The same platform serves different use cases.
+We show two of them live, family care and lone-worker safety, with real phones.
+
+## Who holds what
+| Device | Role | App |
+|---|---|---|
+| Android 1 | "Grandma" living alone (Family care pack) | Phone app `device.html`, slot PHONE 01 |
+| Android 2 | "Arjun", factory worker (Lone worker pack) | Phone app `device.html`, slot PHONE 02 |
+| iPhone 1 | "Rahul", Grandma's son, **first contact** | Responder app, installed on the Home Screen |
+| iPhone 2 | "Priya", Grandma's daughter, **backup** + Arjun's supervisor | Responder app, installed on the Home Screen |
+| PC | Mission Control (cloud view) | Dashboard |
 
 ## The day before
 1. `aws login --region ap-southeast-2` (click **Blank Slate**).
 2. `./scripts/phase.ps1 -Phase demo`: raises the kill-switch cap from $9 to $22.
-3. Optional clean slate: `./scripts/reset-data.ps1` (type RESET). Then do one 5-minute rehearsal, so the time
-   machine has a session to replay.
-4. Charge the 4 phones. Put them on a **mobile hotspot** (college Wi-Fi often blocks WebSockets).
-5. On iPhones: Settings → Apps → Safari → Advanced → **Motion & Orientation Access ON**.
-6. Record a backup screen video of a full run (in case of network trouble).
-
-## Setup (before the teacher arrives)
-- PC: open https://d16yre0rlmnv4p.cloudfront.net, go full screen (F11) and click 🔇 so it shows 🔊 (alarm sound).
-- Phones: scan the **📲 Join** QR code, pick PHONE 01-04, enter a name and a device type, then tap Connect.
-- Check: 4 cards are green, the "Live data flow" diagram shows moving dots, msgs/sec ≈ 4.
+3. Optional clean slate: `./scripts/reset-data.ps1` (type RESET). Rules, responders and zones are kept.
+4. Dashboard → **⚡ Rules & Actions**:
+   - Install **Family care** on P01 and **Lone worker** on P02.
+   - Press **History** on PHONE 01 (14 days of labelled synthetic history for the baseline rule; the ETL runs automatically).
+5. On Android 1, open the phone app:
+   - Join as PHONE 01 "Grandma", Elderly care.
+   - Sensor hub → Location **Always** → **Save this place as zone "Home"**.
+   - Turn on **Continuous monitoring**.
+6. On Android 2, join as PHONE 02 "Arjun", Factory worker. Enable the noise sensor, set Location **Always** and save zone **"Site"**.
+7. Pair the responders:
+   - On the PC (Rules tab → People → **Pair**), or on the monitored phone ("Who gets my alerts?" → Add a responder).
+   - On each iPhone: scan the QR code, choose a role, then **Add to Home Screen**, open it from there, and tap **Enable notifications**.
+   - Press **Test notification**.
+8. Accuracy Lab:
+   - Record about 10 pillow drops and 10 "sit down hard / jump / walk" movements.
+   - Label them, press **Evaluate detector** and note the numbers for the viva.
+9. Charge everything and use a **mobile hotspot** (college Wi-Fi often blocks WebSockets). Record a backup video.
 
 ## The demo
-
 | Time | Who | Action | What to say |
 |---|---|---|---|
-| 0:00 | Presenter | Show the **Live data flow** diagram | "Every dot is a real message: phone → AWS IoT Core → Rules Engine → SQS → S3 data lake. No servers; everything is serverless." |
-| 1:00 | Phone 1 | Tilt and turn the phone | "The 3D phone on screen copies the real phone. 60 sensor readings per second are summarised on the phone itself: edge computing." |
-| 2:00 | Phone 2 | Press **Overheat** | "The phone only sends temperatures. Watch the cloud **predict** the failure…" (purple countdown) "…and now OVERHEAT: the cloud warned us ~16 seconds before." Email arrives. |
-| 3:30 | Phone 2 | Press **Recover** | Alert becomes RESOLVED automatically. |
-| 4:00 | Phone 3 | Press **Crash** | "The device died without telling anyone. AWS IoT noticed the lost connection: OFFLINE in seconds." Then **Reboot**. |
-| 5:00 | Phone 4 | Turn **Wi-Fi/data off** | "A silent network loss: the dashboard shows SIGNAL LOST after 5 s, and AWS confirms OFFLINE after the MQTT keep-alive expires. The feed shows exactly how many seconds it took." Turn it back on. |
-| 6:00 | Phone 1 | Shake hard | VIBRATION warning. |
-| 6:15 | Phone 2 (Elderly care) | Hold it upright, then **drop it onto a pillow** from about 1 m | "Free fall, impact, stillness, all detected on the phone at 60 Hz." The phone asks "Are you OK?". Let the 15 s run out: FALL banner, alarm and email. Then tap "I'm OK now", and the alert is RESOLVED. Repeat once and tap "I'm OK" during the countdown: a false alarm, kept for analytics. |
-| 7:00 | Phone 3 (City noise node) | Tap **Enable noise sensor**, then play loud music or clap near it for over 10 s | "Only the number leaves the phone, never audio." The dB(A) meter rises, and a NOISE_HIGH warning follows after 10 s above 85. |
-| 7:30 | Any phone | Tilt slowly: flat, upright, on its side, upside down | The 3D twin follows with the exact angles, about 1 s behind. Compare the F/B and L/R numbers on the phone with the dashboard card. Click the phone to enlarge it. |
-| 6:30 | Presenter | Dashboard: **📍 Locate** on a card | The phone flashes and vibrates: a command sent back through the IoT Device Shadow. |
-| 7:00 | Presenter | Tab **🪣 Data lake** → **Run ETL** | "Raw JSON (Bronze) becomes clean Parquet (Silver) and Gold views. 18× smaller." Run *Fleet health report* and *Alerts per device*. Show the SQL. |
-| 8:00 | Presenter | **Time machine** → replay the rehearsal at 4× | "Because a data lake keeps raw data, we can replay history." |
-| 9:00 | Presenter | Tab **🚀 Scale test** → 200 devices × 60 s | "Elasticity: from 4 to 200 devices, ~200 msgs/s, through the same pipeline, and we added zero servers." (≈ $0.04 of credits) |
-| 10:00 | Presenter | Header **credits meter**; mention the kill switch | "The whole project cost under $1. AWS Budgets plus an automatic kill switch guarantee the cap." |
+| 0:00 | Presenter | Live tab: pipeline diagram + fleet map | "Every dot is a real message. Phones are IoT sensor nodes: motion, steps, sound, GPS, heart rate. Everything lands in an S3 data lake, and the bottom row is new: the platform **acts**." |
+| 1:00 | Presenter | Rules tab: the packs and rule table | "Same platform, different use cases: a pack is just a set of rules. WHEN the data says X, THEN act." Open **Compiled SQL**: "our live rules become part of the AWS IoT Rule SQL, so the managed Rules Engine filters for us." |
+| 2:00 | Presenter | **＋ New rule**: Heart rate > 120 → push | Save. The toast says the IoT Rule was re-compiled. |
+| 2:30 | Grandma | Sensor hub → **Measure** heart rate (finger on the camera + flash, 20 s) | "Only the number leaves the phone, never the video." The BPM appears on the dashboard card and in the lake. |
+| 3:30 | Grandma | **Drop the phone onto a pillow**, don't answer "Are you OK?" | Countdown 15 s, then FALL. **Rahul's iPhone buzzes** even with the app closed. Show the Step Functions **workflow ↗** link: "it is now waiting for a human". |
+| 4:30 | Rahul | Do nothing for 60 s | The escalation moves to **level 2**: **Priya's iPhone buzzes** too, and an email goes out. The dashboard bar shows "escalated to everyone". |
+| 5:00 | Priya | Tap **I'm handling it** (show Call / Call 112 / Navigate) | Grandma's phone shows **"Priya is responding"**. The dashboard shows the response time. "The workflow resumed through a task token, and the person on the floor knows help is coming." |
+| 6:00 | Grandma | **I'm OK now** | The alert is RESOLVED; responders get "✅ Resolved". |
+| 6:30 | Presenter | **Act on a device → Ask "Are you OK?"** to Grandma | "The same prompt the 'no movement for 3 hours' rule sends automatically. If nobody answers in 5 minutes, the family is told." Grandma taps Yes. |
+| 7:15 | Arjun | Play loud music / clap near the phone for 10+ s | NOISE rule fires: **Arjun's phone shows "wear hearing protection"**, Priya (supervisor) gets a push. |
+| 8:00 | Arjun | Walk out of the room/building (or show the zone on the map) | "Left the site" geofence rule (when outside the zone radius). |
+| 8:30 | Presenter | Rules tab: lake rule **"Less active than usual" → ▶ Run now** | "Athena compares today's REAL steps with Grandma's own 14-day baseline from the Gold layer. History is not just storage, it drives an action." |
+| 9:30 | Presenter | Accuracy Lab: confusion matrix, best settings, **Apply to phones** | "We measured it: X of Y test falls caught, Z false alarms. A phone dropped on its own looks exactly like a fall to the accelerometer, which is why the person gets 15 seconds to answer first. The best thresholds go to every phone over the air through the Device Shadow." |
+| 10:30 | Presenter | Data lake tab: Run ETL, then Gold · rules (response time) and Gold · daily activity | "Every action is in the lake too: we can measure how fast the family responds." |
+| 11:30 | Presenter | Credits meter + kill switch | "The whole project costs under 2 dollars of credits; AWS Budgets plus our kill switch stop everything before the cap." |
 
 ## If something goes wrong
-- A phone is stuck on CONNECTING → switch it to the hotspot / mobile data; reload the page.
-- iPhone tilt does nothing → tap **Enable motion sensors** on the phone (or the Settings toggle above).
-- Nothing connects at all → `./scripts/status.ps1`. If "KILLED", run `./scripts/phase.ps1 -Phase demo`.
-- Total network failure → play the backup video, then show the **time machine** replay.
+- **No push on iPhone:** it must be opened from the Home Screen icon (iOS 16.4+), with notifications allowed in Settings → Notifications → Responder. Use **Test notification**.
+- **No push on Android:** Chrome → site settings → Notifications → allow.
+- **A phone is stuck on CONNECTING:** switch to the hotspot / mobile data and reload.
+- **The heart rate says "signal too weak":** cover both the camera AND the flash with a fingertip, press lightly and keep still. iPhones have no flash control, so use an Android.
+- **Nothing connects:** run `./scripts/status.ps1`. If it says KILLED, run `./scripts/phase.ps1 -Phase demo`.
+- **Total network failure:** play the backup video, then show the time machine and the lake reports.
 
 ## After the evaluation
-`./scripts/teardown.ps1` (type DELETE): removes everything, so nothing can cost money afterwards.
+`./scripts/teardown.ps1` (type DELETE) removes everything, so nothing can cost money afterwards.

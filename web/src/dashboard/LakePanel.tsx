@@ -79,7 +79,7 @@ export function LakePanel() {
           <span className="tag">BRONZE</span>
           <b>Raw JSON</b>
           <small className="mono">{bronzeFiles.toLocaleString()} files · {fmtBytes(bronzeBytes)}</small>
-          <small>telemetry · events · alerts</small>
+          <small>telemetry · events · alerts · traces · actions</small>
         </div>
         <div className="pipe"><i /><i /><i /></div>
         <div className="zone silver">
@@ -92,8 +92,8 @@ export function LakePanel() {
         <div className="zone gold">
           <span className="tag">GOLD</span>
           <b>Athena views</b>
-          <small className="mono">3 views</small>
-          <small>hourly stats · fleet health · alerts</small>
+          <small className="mono">9 views</small>
+          <small>health · noise · safety · activity · baseline · rules</small>
         </div>
         <div className="etl">
           <button className="etl-btn" disabled={etlRunning} onClick={runEtl}>
@@ -122,7 +122,7 @@ export function LakePanel() {
         <div className="lab">
           <textarea className="mono" value={labSql} spellCheck={false} onChange={(e) => setLabSql(e.target.value)} rows={5} />
           <div className="lab-row">
-            <small>Tables: bronze_telemetry · bronze_events · bronze_alerts · silver_telemetry · gold_* views. Read-only, max 200 rows, 100 MB scan cap.</small>
+            <small>Tables: bronze_telemetry · bronze_events · bronze_alerts · bronze_traces · bronze_actions · silver_telemetry · gold_* views. Read-only, max 200 rows, 100 MB scan cap.</small>
             <button className="etl-btn" disabled={running} onClick={() => exec("__lab__", () => api.sql(labSql))}>▶ Run SQL</button>
           </div>
         </div>

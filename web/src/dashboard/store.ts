@@ -2,7 +2,7 @@
 // Plain class + useSyncExternalStore; UI notifications are throttled to ~5/s.
 import { useSyncExternalStore } from "react";
 import { fromW3C, type Quat } from "../shared/quat";
-import { SLOTS, type Alert, type DeviceEvent, type Health, type PresenceEvent, type Telemetry } from "../shared/types";
+import { SLOTS, type ActionLog, type Alert, type DeviceEvent, type Health, type PresenceEvent, type Telemetry } from "../shared/types";
 
 export const SIGNAL_LOST_MS = 5000;
 const HISTORY = 120; // points kept per device for sparklines/charts
@@ -15,7 +15,18 @@ export const PLAYBACK_DELAY_MS = 1200;
 
 export type DeviceStatus = "WAITING" | "OK" | "WARNING" | "FAILED" | "SIGNAL_LOST" | "OFFLINE" | "LEFT";
 export type Mode = "live" | "replay";
-export type MessageKind = "telemetry" | "abnormal" | "event" | "alert" | "alert-critical" | "presence";
+export type MessageKind =
+  | "telemetry"
+  | "abnormal"
+  | "event"
+  | "alert"
+  | "alert-critical"
+  | "alert-lake"
+  | "presence"
+  | "action-push"
+  | "action-escalate"
+  | "action-command"
+  | "action-other";
 
 export interface DeviceView {
   id: string;
@@ -31,6 +42,8 @@ export interface DeviceView {
   hist: { t: number; temp: number; vib: number; hum: number; bat: number; volt: number; noise: number | null }[];
   pose: { t: number; q: Quat }[]; // orientation samples on the local clock, ready for playback
   offs: number[]; // recent (receive time - device time) values; their minimum = clock offset
+  hr?: { bpm: number; quality: number; at: number }; // last camera heart-rate check
+  loc?: { lat: number; lon: number; acc: number; at: number }; // last shared GPS position
 }
 
 /** virtual (load-test) devices are aggregated, not shown as cards */
@@ -55,6 +68,7 @@ export interface FleetSnapshot {
   sims: Record<string, SimView>;
   feed: FeedItem[];
   alerts: Alert[];
+  actions: ActionLog[];
   totalMsgs: number;
   msgsPerSec: number;
   rateHistory: number[]; // msgs per second, oldest first
@@ -62,6 +76,11 @@ export interface FleetSnapshot {
 }
 
 let feedSeq = 0;
+
+/** A usable alert record (old or corrupted rows without device / type are ignored). */
+function isAlert(a: Partial<Alert> | null | undefined): a is Alert {
+  return !!a && typeof a.alertId === "string" && typeof a.deviceId === "string" && typeof a.type === "string" && typeof a.ts === "number";
+}
 const isSim = (id: string) => id.startsWith("SIM_");
 const emptyDevices = () =>
   Object.fromEntries(SLOTS.map((id) => [id, { id, presence: "unknown", hist: [], pose: [], offs: [] } as DeviceView]));
@@ -72,6 +91,7 @@ class FleetStore {
   private sims: Record<string, SimView> = {};
   private feed: FeedItem[] = [];
   private alerts: Alert[] = [];
+  private actions: ActionLog[] = [];
   private totalMsgs = 0;
   private recent: number[] = [];
   private rateHistory: number[] = new Array(RATE_HISTORY).fill(0);
@@ -117,6 +137,7 @@ class FleetStore {
     this.sims = {};
     this.feed = [];
     this.alerts = [];
+    this.actions = [];
     this.recent = [];
     this.dirty = true;
   }
@@ -147,6 +168,7 @@ class FleetStore {
     d.profile = m.profile;
     d.left = false;
     if (d.presence !== "online") d.presence = "online"; // data proves it is connected
+    if (typeof m.lat === "number" && typeof m.lon === "number") d.loc = { lat: m.lat, lon: m.lon, acc: m.gacc ?? 0, at: now };
     d.hist.push({ t: now, temp: m.temp, vib: m.vibPeak, hum: m.hum, bat: m.bat, volt: m.volt, noise: m.noise ?? null });
     if (d.hist.length > HISTORY) d.hist.splice(0, d.hist.length - HISTORY);
     this.queuePose(d, m, now);
@@ -198,8 +220,42 @@ class FleetStore {
       this.push({ deviceId: e.id, tone: "fail", icon: "🆘", text: `SOS pressed by ${e.owner} (${e.id})` });
     } else if (e.type === "SOS_CLEARED") {
       this.push({ deviceId: e.id, tone: "ok", icon: "✋", text: `${e.owner} (${e.id}) cancelled the SOS` });
+    } else if (e.type === "FALL_RECOVERED") {
+      this.push({ deviceId: e.id, tone: "warn", icon: "💛", text: `${e.owner} (${e.id}) fell but got up and walked (impact ${e.impactG ?? "?"} g)` });
+    } else if (e.type === "HR_CHECK" && e.bpm) {
+      d.hr = { bpm: e.bpm, quality: e.quality ?? 0, at: Date.now() };
+      this.push({ deviceId: e.id, tone: "info", icon: "❤️", text: `${e.owner} measured heart rate: ${e.bpm} bpm (camera, quality ${Math.round((e.quality ?? 0) * 100)}%)` });
+    } else if (e.type === "CHECK_OK") {
+      this.push({ deviceId: e.id, tone: "ok", icon: "🙋", text: `${e.owner} answered "I'm OK" on ${e.id}` });
     }
     this.emit("event", e.id);
+    this.dirty = true;
+  }
+
+  /** an action the platform took (push, escalation, device command, acknowledgement) */
+  action(a: ActionLog) {
+    this.actions.unshift(a);
+    if (this.actions.length > 120) this.actions.length = 120;
+    const who = a.owner || a.deviceId || "";
+    const text =
+      a.action === "push" ? `Push ${a.status} → ${a.target}${a.level ? ` (level ${a.level})` : ""}: ${a.detail ?? ""}`
+      : a.action === "escalate" ? `Escalation: ${a.detail}`
+      : a.action === "ack" ? `✋ ${a.detail}`
+      : a.action === "command" ? `Command → ${a.target}: ${a.detail}`
+      : a.action === "unanswered" ? `UNANSWERED: ${who} - ${a.detail}`
+      : a.action === "email" ? `Email: ${a.detail}`
+      : null;
+    if (text) {
+      const tone = a.status === "failed" || a.action === "unanswered" ? "fail" : a.action === "ack" ? "ok" : "info";
+      this.push({ deviceId: a.deviceId, tone, icon: a.action === "push" ? "📲" : a.action === "escalate" ? "🪜" : a.action === "command" ? "↩️" : "⚡", text });
+    }
+    this.emit(a.action === "push" && a.status === "sent" ? "action-push" : a.action === "escalate" ? "action-escalate" : a.action === "command" ? "action-command" : "action-other", a.deviceId);
+    this.dirty = true;
+  }
+
+  setActions(list: ActionLog[]) {
+    const seen = new Set(this.actions.map((a) => `${a.ts}${a.action}${a.target}`));
+    this.actions = [...this.actions, ...list.filter((a) => !seen.has(`${a.ts}${a.action}${a.target}`))].sort((a, b) => b.ts - a.ts).slice(0, 120);
     this.dirty = true;
   }
 
@@ -231,17 +287,18 @@ class FleetStore {
   }
 
   alert(a: Alert) {
+    if (!isAlert(a)) return; // never let one malformed record take the dashboard down
     const i = this.alerts.findIndex((x) => x.alertId === a.alertId);
     if (i >= 0) this.alerts[i] = a;
     else this.alerts.unshift(a);
     this.alerts = this.alerts.slice(0, 150);
-    this.emit(a.severity === "CRITICAL" && a.status === "ACTIVE" ? "alert-critical" : "alert", a.deviceId);
+    this.emit(a.source === "LAKE_RULE" && a.status === "ACTIVE" ? "alert-lake" : a.severity === "CRITICAL" && a.status === "ACTIVE" ? "alert-critical" : "alert", a.deviceId);
     this.dirty = true;
   }
 
   setAlerts(list: Alert[]) {
     const known = new Set(this.alerts.map((a) => a.alertId));
-    this.alerts = [...this.alerts, ...list.filter((a) => !known.has(a.alertId))]
+    this.alerts = [...this.alerts, ...list.filter((a) => isAlert(a) && !known.has(a.alertId))]
       .sort((a, b) => b.ts - a.ts)
       .slice(0, 150);
     this.dirty = true;
@@ -275,6 +332,7 @@ class FleetStore {
       sims: { ...(this.sims ?? {}) },
       feed: [...(this.feed ?? [])],
       alerts: [...(this.alerts ?? [])],
+      actions: [...(this.actions ?? [])],
       totalMsgs: this.totalMsgs ?? 0,
       msgsPerSec: (this.recent?.length ?? 0) / 5,
       rateHistory: [...(this.rateHistory ?? [])],

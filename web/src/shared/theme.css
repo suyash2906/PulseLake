@@ -119,3 +119,11 @@ button {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+
+/* Leaflet map in the dark theme */
+.minimap { border-radius: 12px; overflow: hidden; margin-top: 10px; border: 1px solid var(--border); background: #0b1222; }
+.minimap .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
+.minimap .leaflet-tooltip { background: #111a30; color: #e8eeff; border: 1px solid rgba(120, 160, 255, 0.3); box-shadow: none; }
+.minimap .leaflet-tooltip-top:before { border-top-color: #111a30; }
+.minimap .leaflet-control-attribution { background: rgba(6, 10, 20, 0.7); color: #8a97b8; font-size: 9px; }
+.minimap .leaflet-control-attribution a { color: #9bd8ff; }

@@ -6,7 +6,7 @@ import { fleet, type MessageKind } from "./store";
 // through the AWS services it actually passes through.
 
 const W = 1100;
-const H = 290;
+const H = 385;
 
 interface Node {
   key: string;
@@ -31,6 +31,8 @@ const COLORS = {
   alert: "#ff4d6d",
   event: "#b388ff",
   lake: "#2ee6a6",
+  push: "#ff9f43",
+  command: "#f15bb5",
 };
 
 interface Particle {
@@ -58,11 +60,17 @@ export function Pipeline() {
       N("alert", 640, 232, "λ", "Alert processor", "rules + prediction", "#ffc23d"),
       N("ddb", 820, 232, "🗄️", "DynamoDB", "state + alerts", "#ffc23d"),
       N("sns", 1000, 232, "✉️", "Amazon SNS", "email alerts", "#ff4d6d"),
+      // v3: UNDERSTAND + ACT
+      N("runner", 455, 340, "⏱", "Rule runner", "absence + lake rules /min", "#2ee6a6"),
+      N("act", 640, 340, "λ", "Action dispatcher", "push · commands · log", "#ff9f43"),
+      N("sfn", 820, 340, "🪜", "Step Functions", "escalation workflow", "#ff9f43"),
+      N("resp", 1000, 340, "📲", "Responder phones", "Web Push", "#ff9f43"),
     ];
     const idx = Object.fromEntries(nodes.map((n, i) => [n.key, i]));
     const edges = [
       ["dev", "iot"], ["iot", "dash"], ["iot", "rules"], ["rules", "sqs"], ["sqs", "writer"],
       ["writer", "s3"], ["rules", "alert"], ["alert", "ddb"], ["alert", "sns"],
+      ["runner", "alert"], ["alert", "act"], ["act", "sfn"], ["sfn", "resp"], ["act", "iot"],
     ].map(([a, b]) => [idx[a], idx[b]]);
     const P = (...keys: string[]) => keys.map((k) => idx[k]);
 
@@ -99,6 +107,21 @@ export function Pipeline() {
           c("sns");
           spawn(P("alert", "sns"), COLORS.alert, 5);
         }
+      } else if (kind === "alert-lake") {
+        c("runner"); c("ddb");
+        spawn(P("runner", "alert", "ddb"), COLORS.lake, 5);
+      } else if (kind === "action-push") {
+        c("act"); c("resp");
+        spawn(P("alert", "act", "sfn", "resp"), COLORS.push, 5);
+      } else if (kind === "action-escalate") {
+        c("act"); c("sfn");
+        spawn(P("alert", "act", "sfn"), COLORS.alert, 6);
+      } else if (kind === "action-command") {
+        c("act");
+        spawn(P("act", "iot", "dev"), COLORS.command, 5);
+      } else if (kind === "action-other") {
+        c("act");
+        nodes[idx.act].pulse = 1;
       }
     });
 
@@ -246,6 +269,8 @@ export function Pipeline() {
         <span style={{ color: COLORS.event }}>● device event</span>
         <span style={{ color: COLORS.alert }}>● alert</span>
         <span style={{ color: COLORS.lake }}>● batch written to S3</span>
+        <span style={{ color: COLORS.push }}>● push to a person</span>
+        <span style={{ color: COLORS.command }}>● command to a device</span>
       </div>
     </section>
   );

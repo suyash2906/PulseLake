@@ -28,7 +28,8 @@ foreach ($prefix in "bronze/", "silver/", "athena-results/", "errors/") {
 }
 
 Write-Step "Dropping Silver table and Gold views (the ETL rebuilds them)"
-foreach ($t in "silver_telemetry", "gold_device_hourly", "gold_fleet_health", "gold_alert_summary", "gold_noise_exposure", "gold_safety_events") {
+foreach ($t in "silver_telemetry", "gold_device_hourly", "gold_fleet_health", "gold_alert_summary", "gold_noise_exposure",
+    "gold_safety_events", "gold_daily_activity", "gold_baseline", "gold_heart_rate", "gold_rule_effectiveness") {
     & $AwsExe glue delete-table --database-name $db --name $t --region $Region 2>$null
 }
 
@@ -45,6 +46,20 @@ foreach ($table in @(@{ Name = "pulselake-devices"; Keys = @("deviceId") }, @{ N
     }
     Write-Host "  $($table.Name): deleted $($items.Items.Count) items"
 }
+
+Write-Step "Clearing recorded actions, escalations and lab labels (rules, responders and zones are kept)"
+$platform = Invoke-Aws dynamodb scan --table-name pulselake-platform --projection-expression "pk,sk" --output json | Out-String | ConvertFrom-Json
+$cleared = 0
+foreach ($item in $platform.Items) {
+    $pk = $item.pk.S
+    if ($pk -eq "ACTION" -or $pk -eq "TRACE" -or $pk -eq "LAB" -or $pk.StartsWith("ESC#")) {
+        $keyFile = Join-Path $env:TEMP "pulselake-key.json"
+        [IO.File]::WriteAllText($keyFile, (@{ pk = @{ S = $pk }; sk = @{ S = $item.sk.S } } | ConvertTo-Json -Compress))
+        Invoke-Aws dynamodb delete-item --table-name pulselake-platform --key "file://$keyFile" | Out-Null
+        $cleared++
+    }
+}
+Write-Host "  pulselake-platform: deleted $cleared items"
 
 Write-Step "Deleting device shadows"
 $endpoint = Invoke-Aws iot describe-endpoint --endpoint-type iot:Data-ATS --query endpointAddress --output text

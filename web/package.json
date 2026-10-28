@@ -10,16 +10,29 @@
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",
+    "leaflet": "^1.9.4",
     "mqtt": "^5.10.1",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1140.0",
+    "@aws-sdk/client-iot": "^3.1140.0",
+    "@aws-sdk/client-iot-data-plane": "^3.1140.0",
+    "@aws-sdk/client-s3": "^3.1140.0",
+    "@aws-sdk/client-sfn": "^3.1140.0",
+    "@aws-sdk/client-sns": "^3.1140.0",
+    "@aws-sdk/client-ssm": "^3.1140.0",
+    "@aws-sdk/lib-dynamodb": "^3.1140.0",
+    "@types/leaflet": "^1.9.12",
+    "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/web-push": "^3.6.4",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "web-push": "^3.6.7"
   }
 }

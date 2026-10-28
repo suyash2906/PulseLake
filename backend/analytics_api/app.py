@@ -10,9 +10,11 @@ POST /etl/run          start the Bronze -> Silver -> Gold ETL (async Lambda)
 GET  /etl/status       last ETL run
 GET  /sessions         past phone sessions found in the lake (for the time machine)
 GET  /replay?start=&end=  raw telemetry + events + alerts of a window (max 15 min) to replay
-POST /simulate         start the virtual-fleet load test (max 200 devices x 120 s)
+POST /simulate         start the virtual-fleet load test (max 200 devices x 120 s),
+                       or {"mode": "backfill"}: 14 days of labelled synthetic history for one phone
 GET  /simulate/status  progress of the load test
 GET  /cost             real usage from AWS Budgets + remaining credits
+...and the Rules & Actions / responder / Accuracy Lab routes in platform.py
 
 Safety: this role can only READ the lake (it has no Glue create/delete rights and may only
 write Athena results), Query Lab accepts a single SELECT/WITH statement, and the Athena
@@ -28,6 +30,9 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Key
 
+import lakehouse_api
+import platform_api
+
 athena = boto3.client("athena")
 s3 = boto3.client("s3")
 lambda_client = boto3.client("lambda")
@@ -42,6 +47,7 @@ PRICE_PER_TB = 5.0  # Athena USD per TB scanned (10 MB minimum per query)
 
 SINCE = "dt >= date_format(current_date - interval '1' day, '%Y-%m-%d')"
 PHONES = "id NOT LIKE 'SIM\\_%' ESCAPE '\\'"  # exclude the virtual load-test fleet
+REAL = "coalesce(sensors, '') <> 'synthetic'"  # exclude backfilled demo history
 
 QUERIES = {
     "fleet_summary": {
@@ -54,7 +60,7 @@ SELECT id AS device, max(owner) AS owner, count(*) AS messages,
        sum(CASE WHEN fault <> 'NONE' THEN 1 ELSE 0 END) AS faulty_msgs,
        date_format(from_unixtime(max(ts) / 1000), '%H:%i:%s') AS last_seen_utc
 FROM bronze_telemetry
-WHERE {SINCE} AND {PHONES}
+WHERE {SINCE} AND {PHONES} AND {REAL}
 GROUP BY id
 ORDER BY id""",
     },
@@ -89,7 +95,7 @@ ORDER BY alerts DESC, device""",
 SELECT date_format(from_unixtime(ts / 1000), '%H:%i') AS minute_utc, id AS device,
        round(avg(temp), 1) AS avg_temp_c, round(max(vibpeak), 1) AS max_vibration
 FROM bronze_telemetry
-WHERE {SINCE} AND {PHONES} AND ts > to_unixtime(current_timestamp - interval '2' hour) * 1000
+WHERE {SINCE} AND {PHONES} AND {REAL} AND ts > to_unixtime(current_timestamp - interval '2' hour) * 1000
 GROUP BY 1, 2
 ORDER BY 1, 2""",
     },
@@ -110,7 +116,7 @@ LIMIT 50""",
 SELECT date_format(from_unixtime(ts / 1000), '%H:%i') AS minute_utc, id AS device, max(owner) AS owner,
        round(10 * log10(avg(power(10, noise / 10))), 1) AS leq_dba, max(noisemax) AS max_dba
 FROM bronze_telemetry
-WHERE {SINCE} AND {PHONES} AND noise IS NOT NULL
+WHERE {SINCE} AND {PHONES} AND {REAL} AND noise IS NOT NULL
   AND ts > to_unixtime(current_timestamp - interval '2' hour) * 1000
 GROUP BY 1, 2
 ORDER BY 1 DESC, 2
@@ -140,6 +146,82 @@ LIMIT 120""",
         "title": "Gold · alert summary",
         "layer": "gold",
         "sql": "SELECT * FROM gold_alert_summary ORDER BY times_raised DESC",
+    },
+    "gold_daily_activity": {
+        "title": "Gold · daily activity (steps, active minutes)",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_daily_activity ORDER BY day_utc DESC, device_id LIMIT 100",
+    },
+    "gold_baseline": {
+        "title": "Gold · personal 14-day baseline",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_baseline ORDER BY device_id",
+    },
+    "gold_heart_rate": {
+        "title": "Gold · heart-rate checks per day",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_heart_rate ORDER BY day_utc DESC, device_id",
+    },
+    "gold_rule_effectiveness": {
+        "title": "Gold · rules: alerts, pushes and response time",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_rule_effectiveness ORDER BY alerts DESC",
+    },
+    "gold_data_quality": {
+        "title": "Gold · data quality per day and device",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_data_quality ORDER BY day_utc DESC, device_id LIMIT 100",
+    },
+    "gold_anomalies": {
+        "title": "Gold · statistical anomalies (z-score vs own history)",
+        "layer": "gold",
+        "sql": "SELECT * FROM gold_anomalies ORDER BY hour_utc DESC LIMIT 100",
+    },
+    # ---- Insights tab (charts)
+    "insight_activity": {
+        "title": "Insights · steps per day",
+        "layer": "insight",
+        "sql": """
+SELECT device_id, max(owner) AS owner, CAST(day_utc AS varchar) AS day, sum(steps) AS steps,
+       sum(active_minutes) AS active_minutes, max(source) AS source
+FROM gold_daily_activity
+WHERE day_utc >= current_date - interval '14' day
+GROUP BY device_id, day_utc
+ORDER BY day_utc, device_id""",
+    },
+    "insight_noise_heatmap": {
+        "title": "Insights · noise by hour of day (IST)",
+        "layer": "insight",
+        "sql": """
+SELECT CAST(date(event_time + interval '330' minute) AS varchar) AS day,
+       hour(event_time + interval '330' minute) AS hour_ist,
+       round(10 * log10(avg(power(10, noise_dba / 10))), 1) AS leq_dba, count(*) AS samples
+FROM silver_telemetry
+WHERE noise_dba IS NOT NULL AND event_time > localtimestamp - interval '14' day
+GROUP BY 1, 2
+ORDER BY 1, 2""",
+    },
+    "insight_alerts_daily": {
+        "title": "Insights · alerts per day and severity",
+        "layer": "insight",
+        "sql": """
+SELECT CAST(date(from_unixtime(ts / 1000)) AS varchar) AS day, severity, count(*) AS alerts
+FROM bronze_alerts
+WHERE status = 'ACTIVE' AND dt >= date_format(current_date - interval '14' day, '%Y-%m-%d')
+  AND deviceid NOT LIKE 'SIM\\_%' ESCAPE '\\'
+GROUP BY 1, 2
+ORDER BY 1, 2""",
+    },
+    "action_log": {
+        "title": "Actions taken by the platform (last 24 h)",
+        "layer": "bronze",
+        "sql": f"""
+SELECT date_format(from_unixtime(ts / 1000), '%H:%i:%s') AS time_utc, action, status, deviceid AS device,
+       rulename AS rule, target, level, round(ackms / 1000.0, 1) AS ack_sec, detail
+FROM bronze_actions
+WHERE {SINCE}
+ORDER BY ts DESC
+LIMIT 100""",
     },
 }
 
@@ -205,7 +287,8 @@ def run_query(name, sql=None):
 
 def lake_stats():
     layers = {"bronze/telemetry/": "Bronze · telemetry (JSON)", "bronze/events/": "Bronze · device events (JSON)",
-              "bronze/alerts/": "Bronze · alerts (JSON)", "silver/": "Silver · curated (Parquet)",
+              "bronze/alerts/": "Bronze · alerts (JSON)", "bronze/traces/": "Bronze · motion traces (JSON)",
+              "bronze/actions/": "Bronze · actions taken (JSON)", "silver/": "Silver · curated (Parquet)",
               "athena-results/": "Athena query results"}
     out = []
     for prefix, label in layers.items():
@@ -287,7 +370,7 @@ SELECT to_unixtime(date_trunc('minute', from_unixtime(ts / 1000))) * 1000 AS min
        count(*) AS messages, count(DISTINCT id) AS devices,
        array_join(array_agg(DISTINCT owner), ',') AS owners
 FROM bronze_telemetry
-WHERE dt >= date_format(current_date - interval '7' day, '%Y-%m-%d') AND {PHONES}
+WHERE dt >= date_format(current_date - interval '7' day, '%Y-%m-%d') AND {PHONES} AND {REAL}
 GROUP BY 1
 ORDER BY 1""", max_rows=10000)
     out = []
@@ -316,7 +399,7 @@ def replay(start, end):
     cols, rows = athena_rows(f"""
 SELECT id, owner, profile, seq, ts, rate, health, fault, temp, hum, volt, bat, chg, vib, vibpeak, acc, ori,
        qt0, q, noise, noisemax, sensors
-FROM bronze_telemetry WHERE {window} AND {PHONES} ORDER BY ts LIMIT 20000""")
+FROM bronze_telemetry WHERE {window} AND {PHONES} AND {REAL} ORDER BY ts LIMIT 20000""")
     keep_ori = len(rows) <= 8000  # keep the response well under Lambda's 6 MB limit
     telemetry = []
     for r in rows:
@@ -363,6 +446,20 @@ def simulate_status():
 
 
 def simulate(body):
+    if body.get("mode") == "backfill":
+        device_id = str(body.get("deviceId") or "")
+        if not re.match(r"^PHONE_0[1-4]$", device_id):
+            return respond(400, {"error": "backfill needs a phone slot (PHONE_01..04)"})
+        payload = {"mode": "backfill", "deviceId": device_id, "owner": str(body.get("owner") or "Demo")[:30],
+                   "profile": str(body.get("profile") or "elderly")[:20], "days": max(3, min(14, int(body.get("days", 14))))}
+        res = lambda_client.invoke(FunctionName=SIM_FUNCTION, Payload=json.dumps(payload).encode())
+        result = json.loads(res["Payload"].read() or b"{}")
+        if res.get("FunctionError"):
+            return respond(500, {"error": result.get("errorMessage", "backfill failed")})
+        # rebuild Silver/Gold so the personal baseline includes the new history
+        lambda_client.invoke(FunctionName=ETL_FUNCTION, InvocationType="Event",
+                             Payload=json.dumps({"trigger": "backfill", "mode": "full"}).encode())
+        return respond(200, {**result, "etlStarted": True})
     status = simulate_status()
     now = int(time.time() * 1000)
     if status.get("state") == "RUNNING" and now - int(status.get("at", 0)) < 30_000:
@@ -440,7 +537,8 @@ def handler(event, _context):
         return respond(200, {"devices": DEVICES.scan().get("Items", [])})
     if path == "/alerts":
         res = ALERTS.query(KeyConditionExpression=Key("pk").eq("ALERT"), ScanIndexForward=False, Limit=50)
-        items = [{k: v for k, v in i.items() if k not in ("pk", "sk", "expiresAt")} for i in res.get("Items", [])]
+        items = [{k: v for k, v in i.items() if k not in ("pk", "sk", "expiresAt")} for i in res.get("Items", [])
+                 if i.get("deviceId") and i.get("type")]  # skip incomplete rows
         return respond(200, {"alerts": items})
     if path == "/queries":
         return respond(200, {"queries": [{"name": k, "title": v["title"], "layer": v["layer"]} for k, v in QUERIES.items()]})
@@ -454,9 +552,12 @@ def handler(event, _context):
     if path == "/sql" and method == "POST":
         return query_lab(read_body(event).get("sql", ""))
     if path == "/etl/run" and method == "POST":
+        mode = read_body(event).get("mode", "incremental")
+        if mode not in ("incremental", "full", "optimize"):
+            return respond(400, {"error": "mode must be incremental, full or optimize"})
         lambda_client.invoke(FunctionName=ETL_FUNCTION, InvocationType="Event",
-                             Payload=json.dumps({"trigger": "dashboard"}).encode())
-        return respond(202, {"started": True})
+                             Payload=json.dumps({"trigger": "dashboard", "mode": mode}).encode())
+        return respond(202, {"started": True, "mode": mode})
     if path == "/etl/status":
         value = ssm.get_parameter(Name=ETL_STATUS_PARAM)["Parameter"]["Value"]
         return respond(200, json.loads(value))
@@ -474,6 +575,13 @@ def handler(event, _context):
         return respond(200, simulate_status())
     if path == "/cost":
         return cost()
+    try:
+        body = read_body(event) if method == "POST" else {}
+        routed = platform_api.route(path, method, event, body) or lakehouse_api.route(path, method, event, body)
+    except (platform_api.ApiError, lakehouse_api.ApiError) as e:
+        return respond(e.status, {"error": str(e)})
+    if routed:
+        return respond(*routed)
     return respond(404, {"error": "not found",
                          "routes": ["/fleet", "/alerts", "/queries", "/query/<name>", "/sql", "/lake", "/etl/run",
                                     "/etl/status", "/sessions", "/replay", "/simulate", "/simulate/status", "/cost"]})

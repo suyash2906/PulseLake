@@ -6,6 +6,8 @@ import { setDesired } from "./live";
 import { Sparkline } from "./Sparkline";
 import { statusOf, type DeviceStatus, type DeviceView } from "./store";
 
+const ACT: Record<string, string> = { still: "🧍", walk: "🚶", active: "🏃" };
+
 const STATUS_META: Record<DeviceStatus, { label: string; tone: string }> = {
   WAITING: { label: "WAITING", tone: "off" },
   OK: { label: "HEALTHY", tone: "ok" },
@@ -74,6 +76,8 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
               <M label="Humidity" value={t ? `${t.hum.toFixed(0)}%` : "–"} />
               <M label="Battery" value={t ? `${t.bat}%${t.chg ? " ⚡" : ""}` : "–"} hot={!!t && t.bat < 10} />
               <M label="Voltage" value={t ? `${t.volt.toFixed(2)}V` : "–"} hot={!!t && t.volt > 6} />
+              <M label={`Steps · ${ACT[t?.act ?? "still"]}`} value={t?.stepsDay !== undefined ? t.stepsDay.toLocaleString() : "–"} />
+              <M label="Heart" value={d.hr ? `${d.hr.bpm} bpm` : "–"} hot={!!d.hr && (d.hr.bpm > 120 || d.hr.bpm < 45)} />
               <NoiseMeterCell db={t?.noise ?? null} />
             </div>
           </div>
@@ -109,6 +113,9 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
             </div>
           )}
           {status === "OFFLINE" && <div className="dev-fault sev-failed">☁️ AWS IoT: {d.presenceReason ?? "disconnected"}</div>}
+          {t?.bg && !dead && (
+            <div className="dev-bg">🌙 Running in the background (screen off) · still streaming · motion &amp; fall detection paused by the browser</div>
+          )}
           {!dead && t && (
             <div className="dev-ctl">
               <button title="Phone flashes, vibrates and beeps" onClick={() => setDesired(d.id, { locate: Date.now() })}>📍 Locate</button>
@@ -128,6 +135,7 @@ export const DeviceCard = memo(function DeviceCard({ d, now, joinUrl, alerts }: 
             <span>{ago === null ? "" : ago < 2 ? "live" : `${ago}s ago`}</span>
             <span>{d.latencyMs !== undefined ? `${d.latencyMs} ms` : ""}</span>
             <span>#{t?.seq ?? 0}</span>
+            {d.loc && <span title="sharing GPS">📍 ±{Math.round(d.loc.acc)} m</span>}
             <span>{t?.sensors === "real" ? "REAL sensors" : "simulated"}</span>
           </footer>
         </>

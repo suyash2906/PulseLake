@@ -6,9 +6,12 @@ export type Slot = (typeof SLOTS)[number];
 export const TOPICS = {
   telemetry: (id: string) => `pulselake/devices/${id}/telemetry`,
   events: (id: string) => `pulselake/devices/${id}/events`,
+  traces: (id: string) => `pulselake/devices/${id}/traces`, // raw accelerometer windows (fall candidates)
+  commands: (id: string) => `pulselake/devices/${id}/commands`, // cloud -> device actions
   allTelemetry: "pulselake/devices/+/telemetry",
   allEvents: "pulselake/devices/+/events",
   alerts: "pulselake/alerts",
+  actions: "pulselake/actions", // every action the platform takes (push, escalation, command, ack)
   presence: "$aws/events/presence/+/+",
 };
 
@@ -81,8 +84,21 @@ export interface Telemetry {
   ori?: [number, number, number][]; // v1 messages: Euler samples [alpha, beta, gamma] at 10 Hz
   noise?: number | null; // approx. dB(A), 1 s equivalent level (Leq); null = microphone off
   noiseMax?: number | null; // loudest 100 ms in that second
-  sensors: "real" | "simulated";
+  steps?: number; // steps counted in this window (pedometer on the phone)
+  stepsDay?: number; // steps today on this phone (local date)
+  act?: Activity; // activity recognised on the phone
+  stillSec?: number; // seconds since the last noticeable movement
+  lat?: number; // GPS, only when the owner shares location
+  lon?: number;
+  gacc?: number; // GPS accuracy, metres
+  spd?: number | null; // m/s
+  ext?: Record<string, number>; // any future sensor: no pipeline change needed (schema-on-read)
+  bg?: boolean; // the phone app is in the background (screen off / other app)
+  mp?: boolean; // motion paused: the browser delivers no motion data to hidden pages
+  sensors: "real" | "simulated" | "synthetic";
 }
+
+export type Activity = "still" | "walk" | "active";
 
 /** Published on change on pulselake/devices/{id}/events */
 export interface DeviceEvent {
@@ -99,13 +115,22 @@ export interface DeviceEvent {
     | "FALL_DETECTED" // no answer to "Are you OK?" within 15 s
     | "FALL_CANCELLED" // person tapped "I'm OK" during the countdown (false alarm)
     | "FALL_RESOLVED" // person confirmed OK after the alert was sent
+    | "FALL_RECOVERED" // person got up and walked during the countdown
     | "SOS"
-    | "SOS_CLEARED";
+    | "SOS_CLEARED"
+    | "HR_CHECK" // camera heart-rate measurement
+    | "CHECK_OK"; // answer to the cloud's "Are you OK?" (ASK_OK command)
   fault: Fault;
   health: Health;
   impactG?: number; // fall: peak acceleration at impact, in g
   freeFallMs?: number; // fall: duration of the free-fall phase
   angleChange?: number; // fall: degrees between orientation before and after
+  confidence?: number; // fall: 0-100 evidence score
+  bpm?: number; // HR_CHECK
+  quality?: number; // HR_CHECK: 0-1 signal quality
+  reason?: string;
+  lat?: number;
+  lon?: number;
 }
 
 /** Published by the Alert Lambda on pulselake/alerts */
@@ -114,14 +139,50 @@ export interface Alert {
   deviceId: string;
   owner?: string;
   ts: number;
-  type: string; // OVERHEAT, OFFLINE, VIBRATION, ...
+  type: string; // OVERHEAT, OFFLINE, FALL, or a user rule's code
   severity: "INFO" | "WARNING" | "CRITICAL";
   status: "ACTIVE" | "RESOLVED";
   message: string;
-  source: "DEVICE_FAULT" | "CLOUD_RULE" | "PRESENCE" | "EDGE";
+  source: "DEVICE_FAULT" | "CLOUD_RULE" | "PRESENCE" | "EDGE" | "USER_RULE" | "LAKE_RULE";
   etaSec?: number; // PREDICTED_OVERHEAT: seconds until the limit, at alert time
   predictedLeadSec?: number; // OVERHEAT: how long before it the cloud predicted it
   resolvedAt?: number;
+  ruleId?: string;
+  ruleName?: string;
+  escalation?: "LEVEL1" | "LEVEL2" | "UNANSWERED" | "ACKED";
+  ackBy?: string;
+  ackAt?: number;
+  lat?: number;
+  lon?: number;
+}
+
+/** Cloud -> device on pulselake/devices/{id}/commands */
+export interface Command {
+  cmd: "MESSAGE" | "ASK_OK" | "HELP_COMING" | "SET_RATE" | "ALARM";
+  text?: string;
+  from?: string;
+  timeoutSec?: number;
+  rate?: number;
+  ruleId?: string;
+  alertId?: string;
+  ts: number;
+}
+
+/** Published by the action dispatcher on pulselake/actions (and stored in the lake) */
+export interface ActionLog {
+  ts: number;
+  action: "push" | "escalate" | "email" | "command" | "ack" | "unanswered" | "resolved" | "notify";
+  status: "sent" | "failed" | "skipped" | "done";
+  deviceId?: string;
+  owner?: string;
+  alertId?: string;
+  alertType?: string;
+  ruleId?: string;
+  ruleName?: string;
+  target?: string;
+  level?: number;
+  detail?: string;
+  ackMs?: number;
 }
 
 /** AWS-generated lifecycle event on $aws/events/presence/{connected|disconnected}/{clientId} */
